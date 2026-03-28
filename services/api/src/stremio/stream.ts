@@ -1,4 +1,4 @@
-import { getFilesForContent, getFilesForEpisode, queueProbeJob } from '../db/queries/graph.js';
+import { getFilesForContent, getFilesForEpisode, queueProbeJob, type FileRecord } from '../db/queries/graph.js';
 import { checkDebridAvailability, unrestrictHash, type DebridConfig } from '../debrid/manager.js';
 import { scoreFiles, formatStreamTitle, type UserPreferences } from './scoring.js';
 import { logger } from '../utils/logger.js';
@@ -14,6 +14,14 @@ interface StremioStream {
   infoHash?: string;
   fileIdx?: number;
   behaviorHints?: Record<string, unknown>;
+}
+
+function buildBingeGroup(file: FileRecord, service: string): string {
+  const parts = ['streamdb', service];
+  if (file.resolution) parts.push(file.resolution);
+  if (file.video_codec) parts.push(file.video_codec);
+  if (file.hdr && file.hdr.toLowerCase() !== 'sdr') parts.push(file.hdr);
+  return parts.join('|');
 }
 
 export async function getStreams(
@@ -96,11 +104,19 @@ export async function getStreams(
     // Get direct URL from debrid service
     const result = await unrestrictHash(file.infohash, file.file_idx, sortedDebrid);
     if (result) {
+      const hints: Record<string, unknown> = {
+        notWebReady: true,
+        bingeGroup: buildBingeGroup(file, result.service),
+      };
+      if (file.filename) hints.filename = file.filename;
+      else if (file.torrent_name) hints.filename = file.torrent_name;
+
+      const serviceName = result.service === 'realdebrid' ? 'RD' : result.service === 'torbox' ? 'TB' : result.service;
       streams.push({
-        name: 'StreamDB',
+        name: `StreamDB ${serviceName}`,
         title,
         url: result.url,
-        behaviorHints: { notWebReady: true },
+        behaviorHints: hints,
       });
     }
   }
