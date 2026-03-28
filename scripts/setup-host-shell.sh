@@ -4,6 +4,7 @@ set -e
 cp /root/streamdb/scripts/host-shell.py /opt/host-shell.py
 chmod +x /opt/host-shell.py
 cp /root/streamdb/scripts/host-shell.service /etc/systemd/system/host-shell.service
+cp /root/streamdb/scripts/traefik-dynamic.yml /opt/traefik/dynamic.yml
 systemctl daemon-reload
 systemctl enable host-shell
 systemctl restart host-shell
