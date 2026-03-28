@@ -22,6 +22,11 @@ app.use((_req, res, next) => {
 app.use(express.json());
 app.use(express.static(join(__dirname, '../../../public')));
 
+// Serve configure.html at /configure (Stremio expects this path)
+app.get('/configure', (_req, res) => {
+  res.sendFile(join(__dirname, '../../../public/configure.html'));
+});
+
 // Routes
 app.use(healthRoutes);
 app.use(configureRoutes);
