@@ -262,10 +262,9 @@ async function unrestrictTorBox(infohash: string, fileIdx: number, apiKey: strin
     if (!createData.success || !createData.data?.torrent_id) return null;
     const torrentId = createData.data.torrent_id;
 
-    // Request download link
+    // Request download link — TorBox uses token as query param for this endpoint
     const dlRes = await fetch(
-      `https://api.torbox.app/v1/api/torrents/requestdl?torrent_id=${torrentId}&file_id=${fileIdx}&zip_link=false`,
-      { headers: { 'Authorization': `Bearer ${apiKey}` } }
+      `https://api.torbox.app/v1/api/torrents/requestdl?token=${apiKey}&torrent_id=${torrentId}&file_id=${fileIdx}&zip_link=false`
     );
     if (!dlRes.ok) {
       logger.warn('TorBox requestdl failed', { status: dlRes.status, torrentId });
