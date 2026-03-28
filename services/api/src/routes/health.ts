@@ -36,4 +36,26 @@ router.get('/api/stats', async (_req, res) => {
   }
 });
 
+// Debug: recently probed jobs
+router.get('/api/probes', async (req, res) => {
+  try {
+    const status = (req.query.status as string) || 'completed';
+    const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
+    const result = await pool.query(`
+      SELECT pj.id, pj.infohash, pj.status, pj.error, pj.attempts,
+             pj.completed_at, pj.created_at,
+             f.filename, f.torrent_name, f.file_size, f.resolution,
+             f.video_codec, f.os_hash, f.metadata_src
+      FROM probe_jobs pj
+      LEFT JOIN files f ON f.infohash = pj.infohash AND f.file_idx = 0
+      WHERE pj.status = $1
+      ORDER BY pj.completed_at DESC NULLS LAST, pj.id DESC
+      LIMIT $2
+    `, [status, limit]);
+    res.json(result.rows);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 export default router;
