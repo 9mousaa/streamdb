@@ -78,4 +78,24 @@ router.get('/api/probes', async (req, res) => {
   }
 });
 
+// Admin: clear debrid cache (stale entries from bad API keys)
+router.delete('/api/debrid-cache', async (req, res) => {
+  try {
+    const imdbId = req.query.imdb as string | undefined;
+    if (imdbId) {
+      const result = await pool.query(`
+        DELETE FROM debrid_cache WHERE infohash = ANY(
+          SELECT f.infohash FROM files f JOIN content_files cf ON cf.file_id = f.id
+          JOIN content c ON c.id = cf.content_id WHERE c.imdb_id = $1
+        )`, [imdbId]);
+      res.json({ deleted: result.rowCount, scope: imdbId });
+    } else {
+      const result = await pool.query('DELETE FROM debrid_cache');
+      res.json({ deleted: result.rowCount, scope: 'all' });
+    }
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 export default router;
