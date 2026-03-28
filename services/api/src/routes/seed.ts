@@ -155,43 +155,94 @@ interface DMMHashEntry {
   bytes: number;
 }
 
-function parseDMMHtml(html: string): { imdbId: string | null; entries: DMMHashEntry[] } {
+interface DMMParsedResult {
+  // Map of IMDB ID -> entries
+  byImdb: Map<string, DMMHashEntry[]>;
+}
+
+function parseDMMHtml(html: string): DMMParsedResult {
+  const result: DMMParsedResult = { byImdb: new Map() };
+
   // Extract the LZ-string data from iframe src after #
   const match = html.match(/src="[^"]*#([^"]+)"/);
-  if (!match) return { imdbId: null, entries: [] };
+  if (!match) return result;
 
   const compressed = match[1];
   const decompressed = decompressFromBase64(compressed);
-  if (!decompressed) return { imdbId: null, entries: [] };
+  if (!decompressed) return result;
 
   try {
     const data = JSON.parse(decompressed);
-    // DMM format: { imdbId?: string, files?: [...], hashes?: [...] } or array of entries
-    if (Array.isArray(data)) {
-      return {
-        imdbId: null,
-        entries: data.filter((e: any) => e.hash && e.filename).map((e: any) => ({
-          filename: e.filename || e.title || '',
-          hash: (e.hash || '').toLowerCase(),
-          bytes: e.bytes || e.filesize || e.size || 0,
-        })),
-      };
-    }
 
-    // Object format
-    const imdbId = data.imdbId || data.imdb_id || null;
-    const files = data.files || data.hashes || data.torrents || [];
-    return {
-      imdbId,
-      entries: Array.isArray(files) ? files.filter((e: any) => e.hash && e.filename).map((e: any) => ({
-        filename: e.filename || e.title || '',
-        hash: (e.hash || '').toLowerCase(),
-        bytes: e.bytes || e.filesize || e.size || 0,
-      })) : [],
-    };
+    // DMM hashlists can have various formats:
+    // 1. { "tt1234567": [...hashes...], "tt2345678": [...] } — keyed by IMDB
+    // 2. { imdbId: "tt...", files: [...] }
+    // 3. Array of { hash, filename, imdb?, ... }
+    // 4. { files: [{ hash, filename, ... }] } with top-level imdbId
+
+    if (Array.isArray(data)) {
+      // Array format — group by IMDB if present
+      for (const entry of data) {
+        const hash = (entry.hash || entry.infohash || '').toLowerCase();
+        if (!hash || hash.length !== 40) continue;
+        const imdb = entry.imdb || entry.imdb_id || entry.imdbId;
+        if (!imdb || !imdb.startsWith('tt')) continue;
+
+        const arr = result.byImdb.get(imdb) || [];
+        arr.push({
+          filename: entry.filename || entry.title || '',
+          hash,
+          bytes: entry.bytes || entry.filesize || entry.size || 0,
+        });
+        result.byImdb.set(imdb, arr);
+      }
+    } else if (typeof data === 'object') {
+      // Check if keys are IMDB IDs
+      const keys = Object.keys(data);
+      const imdbKeys = keys.filter(k => k.startsWith('tt'));
+
+      if (imdbKeys.length > 0) {
+        // Format: { "tt1234567": [...entries...] }
+        for (const imdbId of imdbKeys) {
+          const entries = Array.isArray(data[imdbId]) ? data[imdbId] : [];
+          const parsed: DMMHashEntry[] = [];
+          for (const e of entries) {
+            const hash = (e.hash || e.infohash || '').toLowerCase();
+            if (!hash || hash.length !== 40) continue;
+            parsed.push({
+              filename: e.filename || e.title || e.name || '',
+              hash,
+              bytes: e.bytes || e.filesize || e.size || 0,
+            });
+          }
+          if (parsed.length > 0) result.byImdb.set(imdbId, parsed);
+        }
+      } else {
+        // Single object: { imdbId, files/hashes/torrents }
+        const imdbId = data.imdbId || data.imdb_id || data.imdb;
+        if (imdbId && imdbId.startsWith('tt')) {
+          const files = data.files || data.hashes || data.torrents || [];
+          if (Array.isArray(files)) {
+            const parsed: DMMHashEntry[] = [];
+            for (const e of files) {
+              const hash = (e.hash || e.infohash || '').toLowerCase();
+              if (!hash || hash.length !== 40) continue;
+              parsed.push({
+                filename: e.filename || e.title || '',
+                hash,
+                bytes: e.bytes || e.filesize || e.size || 0,
+              });
+            }
+            if (parsed.length > 0) result.byImdb.set(imdbId, parsed);
+          }
+        }
+      }
+    }
   } catch {
-    return { imdbId: null, entries: [] };
+    // ignore parse errors
   }
+
+  return result;
 }
 
 async function importDMMEntries(
@@ -280,18 +331,43 @@ async function seedFromDMM() {
         continue;
       }
 
-      const { imdbId, entries } = parseDMMHtml(html);
-      if (!entries.length) {
+      const { byImdb } = parseDMMHtml(html);
+
+      // Log first file's structure for debugging
+      if (i === 0) {
+        logger.info(`Seed: First file parsed - ${byImdb.size} IMDB IDs found`);
+        // Also log raw decompressed structure
+        const matchDebug = html.match(/src="[^"]*#([^"]+)"/);
+        if (matchDebug) {
+          const dec = decompressFromBase64(matchDebug[1]);
+          if (dec) {
+            try {
+              const parsed = JSON.parse(dec);
+              const keys = Object.keys(parsed).slice(0, 5);
+              logger.info(`Seed: Data keys sample: ${JSON.stringify(keys)}`);
+              if (keys[0]) {
+                const val = parsed[keys[0]];
+                logger.info(`Seed: First key "${keys[0]}" type: ${typeof val}, isArray: ${Array.isArray(val)}, sample: ${JSON.stringify(val).substring(0, 300)}`);
+              }
+            } catch {
+              logger.info(`Seed: Raw decompressed (first 500): ${dec.substring(0, 500)}`);
+            }
+          }
+        }
+      }
+
+      if (byImdb.size === 0) {
         await sleep(500);
         continue;
       }
 
-      // Use filename-derived IMDB ID or embedded one
-      const id = imdbId || `dmm_${file.name.replace('.html', '')}`;
-
-      const count = await importDMMEntries(client, id, entries);
-      total += count;
-      batchCount += count;
+      let fileCount = 0;
+      for (const [imdbId, entries] of byImdb) {
+        const count = await importDMMEntries(client, imdbId, entries);
+        fileCount += count;
+      }
+      total += fileCount;
+      batchCount += fileCount;
 
       if (batchCount >= 500) {
         await client.query('COMMIT');
@@ -300,7 +376,9 @@ async function seedFromDMM() {
       }
 
       seedProgress = { phase: 'importing', processed: i + 1, total: files.length };
-      logger.debug(`Seed: [${i + 1}/${files.length}] ${file.name}: ${count} hashes (total: ${total})`);
+      if (fileCount > 0) {
+        logger.info(`Seed: [${i + 1}/${files.length}] ${file.name}: ${fileCount} hashes (total: ${total})`);
+      }
 
       // Rate limit GitHub
       await sleep(1500);
