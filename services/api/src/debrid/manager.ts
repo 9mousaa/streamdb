@@ -69,26 +69,42 @@ export async function checkDebridAvailability(
 
 async function checkRealDebrid(hashes: string[], apiKey: string): Promise<Set<string>> {
   const available = new Set<string>();
-  // Batch in groups of 100
-  for (let i = 0; i < hashes.length; i += 100) {
-    const batch = hashes.slice(i, i + 100);
-    const url = `https://api.real-debrid.com/rest/1.0/torrents/instantAvailability/${batch.join('/')}`;
-    const res = await fetch(url, {
-      headers: { 'Authorization': `Bearer ${apiKey}` },
+  // RD deprecated instantAvailability — use addMagnet + check status instead
+  // Process up to 5 at a time to avoid rate limits
+  for (let i = 0; i < hashes.length; i += 5) {
+    const batch = hashes.slice(i, i + 5);
+    const checks = batch.map(async (hash) => {
+      try {
+        const addRes = await fetch('https://api.real-debrid.com/rest/1.0/torrents/addMagnet', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${apiKey}`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: `magnet=magnet:?xt=urn:btih:${hash}`,
+        });
+        if (!addRes.ok) return;
+        const { id } = await addRes.json() as { id: string };
+
+        // Check info — if status is 'waiting_files_selection', it's cached
+        const infoRes = await fetch(`https://api.real-debrid.com/rest/1.0/torrents/info/${id}`, {
+          headers: { 'Authorization': `Bearer ${apiKey}` },
+        });
+        if (!infoRes.ok) return;
+        const info = await infoRes.json() as { status?: string; files?: any[] };
+
+        if (info.status === 'waiting_files_selection' || info.status === 'downloaded') {
+          available.add(hash);
+        }
+
+        // Clean up — delete the torrent entry to not pollute user's list
+        await fetch(`https://api.real-debrid.com/rest/1.0/torrents/delete/${id}`, {
+          method: 'DELETE',
+          headers: { 'Authorization': `Bearer ${apiKey}` },
+        });
+      } catch { /* skip */ }
     });
-
-    if (!res.ok) {
-      logger.warn('RealDebrid API error', { status: res.status });
-      continue;
-    }
-
-    const data = await res.json() as Record<string, any>;
-    for (const hash of batch) {
-      const entry = data[hash] || data[hash.toLowerCase()];
-      if (entry && entry.rd && entry.rd.length > 0) {
-        available.add(hash);
-      }
-    }
+    await Promise.all(checks);
   }
   return available;
 }
