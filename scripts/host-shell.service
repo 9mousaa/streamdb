@@ -1,0 +1,13 @@
+[Unit]
+Description=Host Shell API
+After=network.target docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/host-shell.py
+Restart=always
+RestartSec=2
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target
