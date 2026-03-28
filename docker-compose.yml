@@ -1,0 +1,52 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: streamdb-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: streamdb
+      POSTGRES_USER: streamdb
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-streamdb_secret}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./shared/db/migrations:/docker-entrypoint-initdb.d
+    networks:
+      - streamdb-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U streamdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    container_name: streamdb-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://streamdb:${POSTGRES_PASSWORD:-streamdb_secret}@postgres:5432/streamdb
+      PORT: 3000
+      NODE_ENV: production
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      BASE_URL: ${BASE_URL:-https://streamdb.plaio.cc}
+    networks:
+      - streamdb-internal
+      - traefik_proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.streamdb.rule=Host(`streamdb.plaio.cc`)"
+      - "traefik.http.routers.streamdb.entrypoints=websecure"
+      - "traefik.http.routers.streamdb.tls.certresolver=myresolver"
+      - "traefik.http.services.streamdb.loadbalancer.server.port=3000"
+
+volumes:
+  pgdata:
+
+networks:
+  streamdb-internal:
+  traefik_proxy:
+    external: true

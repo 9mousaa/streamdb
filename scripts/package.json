@@ -1,0 +1,16 @@
+{
+  "name": "streamdb-scripts",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "better-sqlite3": "^11.7.0",
+    "parse-torrent-title": "^0.7.1",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
