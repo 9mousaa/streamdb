@@ -20,7 +20,7 @@ app.use((_req, res, next) => {
 });
 
 app.use(express.json());
-app.use(express.static(join(__dirname, '../../public')));
+app.use(express.static(join(__dirname, '../../../public')));
 
 // Routes
 app.use(healthRoutes);
