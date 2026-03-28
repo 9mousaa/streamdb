@@ -18,14 +18,14 @@ import { config } from '../config.js';
 const FLUSH_INTERVAL = 15_000; // Flush to DB every 15s (higher throughput with active crawl)
 const MAX_BATCH = 2000;
 
-let pendingHashes: string[] = [];
+let pendingHashes: { hash: string; hasPeers: boolean }[] = [];
 let dhtListener: DHTListener | null = null;
 
 export function startDHTCrawler(): void {
   logger.info('Starting DHT crawler', { port: config.dhtPort });
 
-  dhtListener = new DHTListener(config.dhtPort, (infohash) => {
-    pendingHashes.push(infohash);
+  dhtListener = new DHTListener(config.dhtPort, (infohash, hasRealPeers) => {
+    pendingHashes.push({ hash: infohash, hasPeers: hasRealPeers });
   });
 
   // Periodically flush discovered hashes to database
@@ -47,16 +47,21 @@ async function flushToDatabase(): Promise<void> {
 
   // Take up to MAX_BATCH hashes
   const batch = pendingHashes.splice(0, MAX_BATCH);
-  const unique = [...new Set(batch)];
 
-  if (!unique.length) return;
+  // Deduplicate, keeping highest peer status
+  const hashMap = new Map<string, boolean>();
+  for (const { hash, hasPeers } of batch) {
+    hashMap.set(hash, hashMap.get(hash) || hasPeers);
+  }
+
+  if (!hashMap.size) return;
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
     let inserted = 0;
-    for (const hash of unique) {
+    for (const [hash, hasPeers] of hashMap) {
       // Only insert if this infohash doesn't already exist
       const result = await client.query(`
         INSERT INTO files (infohash, file_idx, metadata_src, confidence)
@@ -66,20 +71,26 @@ async function flushToDatabase(): Promise<void> {
       `, [hash]);
 
       if (result.rows.length > 0) {
-        // New file — queue for probing
+        // New file — queue for probing. Higher priority for hashes with confirmed peers.
         await client.query(`
           INSERT INTO probe_jobs (infohash, priority, source)
-          VALUES ($1, 0, 'dht')
-          ON CONFLICT (infohash) DO NOTHING
-        `, [hash]);
+          VALUES ($1, $2, 'dht')
+          ON CONFLICT (infohash) DO UPDATE SET priority = GREATEST(probe_jobs.priority, $2)
+        `, [hash, hasPeers ? 5 : 0]);
         inserted++;
+      } else if (hasPeers) {
+        // File already exists but now has peers — boost priority
+        await client.query(`
+          UPDATE probe_jobs SET priority = GREATEST(priority, 5)
+          WHERE infohash = $1 AND status = 'pending'
+        `, [hash]);
       }
     }
 
     await client.query('COMMIT');
 
     if (inserted > 0) {
-      logger.debug('DHT flush', { checked: unique.length, newFiles: inserted });
+      logger.debug('DHT flush', { checked: hashMap.size, newFiles: inserted });
     }
   } catch (err) {
     await client.query('ROLLBACK');
@@ -93,7 +104,7 @@ export function getDHTStats(): { routingTableSize: number; infohashesDiscovered:
   if (!dhtListener) return null;
   return {
     ...dhtListener.getStats(),
-    pendingFlush: pendingHashes.length,
+    pendingFlush: pendingHashes.length as number,
   };
 }
 

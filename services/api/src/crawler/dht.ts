@@ -23,10 +23,10 @@ const BOOTSTRAP_NODES = [
   { host: 'dht.libtorrent.org', port: 25401 },
 ];
 
-const MAX_ROUTING_TABLE = 5000;
+const MAX_ROUTING_TABLE = 3000;
 const FIND_NODE_INTERVAL = 5000; // 5s between find_node bursts
-const CRAWL_INTERVAL = 1000; // 1s between active crawl rounds
-const MAX_INFOHASH_BUFFER = 50000;
+const CRAWL_INTERVAL = 2000; // 2s between active crawl rounds (reduced from 1s for memory)
+const MAX_INFOHASH_BUFFER = 20000;
 
 interface DHTNode {
   id: Buffer;
@@ -119,18 +119,18 @@ export class DHTListener {
   private routingTable: Map<string, DHTNode> = new Map();
   private transactionCounter = 0;
   private infohashBuffer: Set<string> = new Set();
-  private onInfohash: (infohash: string) => void;
+  private onInfohash: (infohash: string, hasRealPeers: boolean) => void;
   // Track pending get_peers transactions → infohash they were looking for
   private pendingGetPeers: Map<string, string> = new Map();
   private crawlPosition: number = 0; // For systematic keyspace walking
   // Cache of infohash → actual peers (from get_peers values + announce_peer)
   private peerCache: Map<string, { host: string; port: number; ts: number }[]> = new Map();
-  private static readonly PEER_CACHE_MAX = 50_000;
+  private static readonly PEER_CACHE_MAX = 20_000;
   private static readonly PEER_CACHE_TTL = 5 * 60_000; // 5 minutes
   // Per-transaction callbacks for iterative lookups
   private txCallbacks: Map<string, (r: any, rinfo: RemoteInfo) => void> = new Map();
 
-  constructor(port: number, onInfohash: (infohash: string) => void) {
+  constructor(port: number, onInfohash: (infohash: string, hasRealPeers: boolean) => void) {
     this.nodeId = randomBytes(20);
     this.onInfohash = onInfohash;
 
@@ -143,7 +143,7 @@ export class DHTListener {
       this.bootstrap();
       setInterval(() => this.expandRoutingTable(), FIND_NODE_INTERVAL);
       setInterval(() => this.activeCrawl(), CRAWL_INTERVAL);
-      setInterval(() => this.cleanPeerCache(), 60_000); // Clean stale peers every minute
+      setInterval(() => { this.cleanPeerCache(); this.cleanTxCallbacks(); }, 60_000);
     });
   }
 
@@ -311,7 +311,7 @@ export class DHTListener {
       this.pendingGetPeers.delete(txKey);
       // If response contains "values", peers exist for this infohash — it's active
       if (Array.isArray(r.values) && r.values.length > 0) {
-        this.recordInfohash(pendingHash);
+        this.recordInfohash(pendingHash, true);
         // Parse compact peer info (6 bytes each: 4 IP + 2 port) and cache
         const now = Date.now();
         const peers = this.peerCache.get(pendingHash) || [];
@@ -363,9 +363,9 @@ export class DHTListener {
     }
 
     if (q === 'announce_peer' && Buffer.isBuffer(a.info_hash) && a.info_hash.length === 20) {
-      // Someone is announcing they have this torrent — confirmed active torrent
+      // Someone is announcing they have this torrent — confirmed active torrent with real peer
       const infohash = a.info_hash.toString('hex');
-      this.recordInfohash(infohash);
+      this.recordInfohash(infohash, true);
 
       // The announcing node IS a peer — cache it
       // BEP-5: if implied_port is set, use UDP source port; otherwise use a.port
@@ -406,7 +406,7 @@ export class DHTListener {
     }
   }
 
-  private recordInfohash(infohash: string): void {
+  private recordInfohash(infohash: string, hasRealPeers = false): void {
     if (this.infohashBuffer.has(infohash)) return;
     this.infohashBuffer.add(infohash);
 
@@ -416,7 +416,7 @@ export class DHTListener {
       this.infohashBuffer.delete(first);
     }
 
-    this.onInfohash(infohash);
+    this.onInfohash(infohash, hasRealPeers);
   }
 
   private addNode(id: Buffer, host: string, port: number): void {
@@ -635,6 +635,13 @@ export class DHTListener {
     return peers
       .filter(p => now - p.ts < DHTListener.PEER_CACHE_TTL)
       .map(p => ({ host: p.host, port: p.port }));
+  }
+
+  private cleanTxCallbacks(): void {
+    // txCallbacks from abandoned iterative lookups — just clear any stragglers
+    if (this.txCallbacks.size > 1000) {
+      this.txCallbacks.clear();
+    }
   }
 
   private cleanPeerCache(): void {
