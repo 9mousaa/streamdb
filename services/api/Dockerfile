@@ -4,12 +4,17 @@ RUN apk add --no-cache ffmpeg
 
 WORKDIR /app
 
-# Install dependencies
+# Install API dependencies
 COPY services/api/package.json services/api/package-lock.json* ./services/api/
 RUN cd services/api && npm install
 
+# Install script dependencies
+COPY scripts/package.json ./scripts/
+RUN cd scripts && npm install
+
 # Copy source
 COPY services/api/ ./services/api/
+COPY scripts/ ./scripts/
 COPY shared/ ./shared/
 COPY public/ ./public/
 

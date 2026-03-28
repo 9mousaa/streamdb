@@ -36,7 +36,7 @@ services:
       TMDB_API_KEY: ${TMDB_API_KEY:-}
       PROBE_RD_API_KEY: ${PROBE_RD_API_KEY:-}
       PROBE_INTERVAL_MS: ${PROBE_INTERVAL_MS:-30000}
-      DHT_ENABLED: ${DHT_ENABLED:-false}
+      DHT_ENABLED: ${DHT_ENABLED:-true}
       DHT_PORT: ${DHT_PORT:-6881}
     ports:
       - "${DHT_PORT:-6881}:${DHT_PORT:-6881}/udp"
