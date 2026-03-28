@@ -1,5 +1,5 @@
 import { getFilesForContent, getFilesForEpisode, queueProbeJob } from '../db/queries/graph.js';
-import { checkDebridAvailability, unrestrictRealDebrid, type DebridConfig } from '../debrid/manager.js';
+import { checkDebridAvailability, unrestrictHash, type DebridConfig } from '../debrid/manager.js';
 import { scoreFiles, formatStreamTitle, type UserPreferences } from './scoring.js';
 import { logger } from '../utils/logger.js';
 
@@ -81,45 +81,28 @@ export async function getStreams(
   // Score and rank
   const scored = scoreFiles(cachedFiles, prefs);
 
-  // Build stream objects
+  // Build stream objects — only direct URLs, no raw infohash fallback
   const maxStreams = singleStream ? 1 : 15;
   const streams: StremioStream[] = [];
+  // Sort debrid configs by priority for unrestrict attempts
+  const sortedDebrid = [...debridConfigs].sort((a, b) => a.priority - b.priority);
+
   for (const { file, score } of scored.slice(0, maxStreams)) {
     const avail = availability.get(file.infohash);
-    const bestService = avail?.sort((a, b) => {
-      const aP = debridConfigs.find(d => d.service === a.service)?.priority ?? 99;
-      const bP = debridConfigs.find(d => d.service === b.service)?.priority ?? 99;
-      return aP - bP;
-    })[0];
-
-    if (!bestService) continue;
+    if (!avail?.some(a => a.available)) continue;
 
     const title = formatStreamTitle(file, score);
 
-    // For RD, try to get direct CDN link
-    if (bestService.service === 'realdebrid') {
-      const rdConfig = debridConfigs.find(d => d.service === 'realdebrid');
-      if (rdConfig) {
-        const url = await unrestrictRealDebrid(file.infohash, rdConfig.apiKey);
-        if (url) {
-          streams.push({
-            name: 'StreamDB',
-            title,
-            url,
-            behaviorHints: { notWebReady: true },
-          });
-          continue;
-        }
-      }
+    // Get direct URL from debrid service
+    const result = await unrestrictHash(file.infohash, file.file_idx, sortedDebrid);
+    if (result) {
+      streams.push({
+        name: 'StreamDB',
+        title,
+        url: result.url,
+        behaviorHints: { notWebReady: true },
+      });
     }
-
-    // Fallback: return infohash for Stremio to handle
-    streams.push({
-      name: 'StreamDB',
-      title,
-      infoHash: file.infohash,
-      fileIdx: file.file_idx,
-    });
   }
 
   logger.info('Streams served', { imdbId, total: files.length, cached: cachedFiles.length, returned: streams.length });

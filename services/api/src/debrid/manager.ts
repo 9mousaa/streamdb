@@ -146,7 +146,29 @@ async function cacheAvailability(infohash: string, service: string, available: b
   `, [infohash, service, available]);
 }
 
-export async function unrestrictRealDebrid(infohash: string, apiKey: string): Promise<string | null> {
+/**
+ * Get a direct download URL from a debrid service for a given infohash.
+ * Tries each configured service in priority order until one succeeds.
+ */
+export async function unrestrictHash(
+  infohash: string,
+  fileIdx: number,
+  debridConfigs: DebridConfig[]
+): Promise<{ url: string; service: string } | null> {
+  for (const cfg of debridConfigs) {
+    try {
+      const url = cfg.service === 'realdebrid'
+        ? await unrestrictRealDebrid(infohash, fileIdx, cfg.apiKey)
+        : await unrestrictTorBox(infohash, fileIdx, cfg.apiKey);
+      if (url) return { url, service: cfg.service };
+    } catch (err: any) {
+      logger.warn(`Unrestrict failed for ${cfg.service}`, { infohash, error: err.message });
+    }
+  }
+  return null;
+}
+
+export async function unrestrictRealDebrid(infohash: string, fileIdx: number, apiKey: string): Promise<string | null> {
   try {
     // Add magnet
     const addRes = await fetch('https://api.real-debrid.com/rest/1.0/torrents/addMagnet', {
@@ -160,38 +182,89 @@ export async function unrestrictRealDebrid(infohash: string, apiKey: string): Pr
     if (!addRes.ok) return null;
     const { id } = await addRes.json() as { id: string };
 
-    // Select all files
-    await fetch(`https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${id}`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: 'files=all',
-    });
-
-    // Get info
+    // Get torrent info to find the right file
     const infoRes = await fetch(`https://api.real-debrid.com/rest/1.0/torrents/info/${id}`, {
       headers: { 'Authorization': `Bearer ${apiKey}` },
     });
     if (!infoRes.ok) return null;
-    const info = await infoRes.json() as { links?: string[] };
-    if (!info.links?.length) return null;
+    const info = await infoRes.json() as { files?: { id: number; path: string; bytes: number; selected: number }[]; links?: string[]; status?: string };
 
-    // Unrestrict first link
-    const unRes = await fetch('https://api.real-debrid.com/rest/1.0/unrestrict/link', {
+    // If files are available but not yet selected, select the target file
+    if (info.files && info.files.length > 0 && (!info.links || info.links.length === 0)) {
+      // RD file IDs are 1-based; fileIdx is 0-based
+      const targetFileId = fileIdx + 1;
+      const fileExists = info.files.some(f => f.id === targetFileId);
+      const selectId = fileExists ? String(targetFileId) : 'all';
+
+      await fetch(`https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${id}`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: `files=${selectId}`,
+      });
+
+      // Re-fetch info after selecting
+      const infoRes2 = await fetch(`https://api.real-debrid.com/rest/1.0/torrents/info/${id}`, {
+        headers: { 'Authorization': `Bearer ${apiKey}` },
+      });
+      if (!infoRes2.ok) return null;
+      const info2 = await infoRes2.json() as { links?: string[] };
+      if (!info2.links?.length) return null;
+
+      // Unrestrict the first available link
+      return await unrestrictRdLink(info2.links[0], apiKey);
+    }
+
+    if (!info.links?.length) return null;
+    return await unrestrictRdLink(info.links[0], apiKey);
+  } catch (err: any) {
+    logger.error('RealDebrid unrestrict failed', { error: err.message });
+    return null;
+  }
+}
+
+async function unrestrictRdLink(link: string, apiKey: string): Promise<string | null> {
+  const unRes = await fetch('https://api.real-debrid.com/rest/1.0/unrestrict/link', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: `link=${encodeURIComponent(link)}`,
+  });
+  if (!unRes.ok) return null;
+  const { download } = await unRes.json() as { download: string };
+  return download;
+}
+
+async function unrestrictTorBox(infohash: string, fileIdx: number, apiKey: string): Promise<string | null> {
+  try {
+    // Create torrent request
+    const createRes = await fetch('https://api.torbox.app/v1/api/torrents/createtorrent', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Type': 'application/json',
       },
-      body: `link=${encodeURIComponent(info.links[0])}`,
+      body: JSON.stringify({ magnet: `magnet:?xt=urn:btih:${infohash}`, seed: 1 }),
     });
-    if (!unRes.ok) return null;
-    const { download } = await unRes.json() as { download: string };
-    return download;
+    if (!createRes.ok) return null;
+    const createData = await createRes.json() as { data?: { torrent_id: number } };
+    const torrentId = createData.data?.torrent_id;
+    if (!torrentId) return null;
+
+    // Request download link
+    const dlRes = await fetch(
+      `https://api.torbox.app/v1/api/torrents/requestdl?torrent_id=${torrentId}&file_id=${fileIdx}&zip_link=false`,
+      { headers: { 'Authorization': `Bearer ${apiKey}` } }
+    );
+    if (!dlRes.ok) return null;
+    const dlData = await dlRes.json() as { data?: string };
+    return dlData.data || null;
   } catch (err: any) {
-    logger.error('RealDebrid unrestrict failed', { error: err.message });
+    logger.error('TorBox unrestrict failed', { error: err.message });
     return null;
   }
 }
