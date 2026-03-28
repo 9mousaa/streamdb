@@ -69,8 +69,8 @@ export async function checkDebridAvailability(
 
 async function checkRealDebrid(hashes: string[], apiKey: string): Promise<Set<string>> {
   const available = new Set<string>();
-  // RD deprecated instantAvailability — use addMagnet + check status instead
-  // Process up to 5 at a time to avoid rate limits
+  // RD deprecated instantAvailability. Use addMagnet + check status.
+  // Don't delete — we keep the entry so unrestrict can use it directly.
   for (let i = 0; i < hashes.length; i += 5) {
     const batch = hashes.slice(i, i + 5);
     const checks = batch.map(async (hash) => {
@@ -86,22 +86,21 @@ async function checkRealDebrid(hashes: string[], apiKey: string): Promise<Set<st
         if (!addRes.ok) return;
         const { id } = await addRes.json() as { id: string };
 
-        // Check info — if status is 'waiting_files_selection', it's cached
         const infoRes = await fetch(`https://api.real-debrid.com/rest/1.0/torrents/info/${id}`, {
           headers: { 'Authorization': `Bearer ${apiKey}` },
         });
         if (!infoRes.ok) return;
-        const info = await infoRes.json() as { status?: string; files?: any[] };
+        const info = await infoRes.json() as { status?: string };
 
         if (info.status === 'waiting_files_selection' || info.status === 'downloaded') {
           available.add(hash);
+        } else {
+          // Not cached — delete to keep user's list clean
+          await fetch(`https://api.real-debrid.com/rest/1.0/torrents/delete/${id}`, {
+            method: 'DELETE',
+            headers: { 'Authorization': `Bearer ${apiKey}` },
+          }).catch(() => {});
         }
-
-        // Clean up — delete the torrent entry to not pollute user's list
-        await fetch(`https://api.real-debrid.com/rest/1.0/torrents/delete/${id}`, {
-          method: 'DELETE',
-          headers: { 'Authorization': `Bearer ${apiKey}` },
-        });
       } catch { /* skip */ }
     });
     await Promise.all(checks);
@@ -186,7 +185,7 @@ export async function unrestrictHash(
 
 export async function unrestrictRealDebrid(infohash: string, fileIdx: number, apiKey: string): Promise<string | null> {
   try {
-    // Add magnet
+    // Add magnet (may already exist from availability check)
     const addRes = await fetch('https://api.real-debrid.com/rest/1.0/torrents/addMagnet', {
       method: 'POST',
       headers: {
@@ -195,8 +194,12 @@ export async function unrestrictRealDebrid(infohash: string, fileIdx: number, ap
       },
       body: `magnet=magnet:?xt=urn:btih:${infohash}`,
     });
-    if (!addRes.ok) return null;
+    if (!addRes.ok) {
+      logger.warn('RD addMagnet failed', { infohash: infohash.slice(0, 8), status: addRes.status });
+      return null;
+    }
     const { id } = await addRes.json() as { id: string };
+    logger.debug('RD addMagnet ok', { infohash: infohash.slice(0, 8), id });
 
     // Get torrent info to find the right file
     const infoRes = await fetch(`https://api.real-debrid.com/rest/1.0/torrents/info/${id}`, {
