@@ -8,9 +8,8 @@ WORKDIR /app
 COPY services/api/package.json services/api/package-lock.json* ./services/api/
 RUN cd services/api && npm install
 
-# Install script dependencies
-COPY scripts/package.json ./scripts/
-RUN cd scripts && npm install
+# Install script dependencies (pg for DB, tsx for TypeScript)
+RUN mkdir -p scripts && cd scripts && npm init -y > /dev/null && npm install pg tsx typescript 2>/dev/null
 
 # Copy source
 COPY services/api/ ./services/api/
