@@ -123,6 +123,10 @@ export class DHTListener {
   // Track pending get_peers transactions → infohash they were looking for
   private pendingGetPeers: Map<string, string> = new Map();
   private crawlPosition: number = 0; // For systematic keyspace walking
+  // Cache of infohash → actual peers (from get_peers values + announce_peer)
+  private peerCache: Map<string, { host: string; port: number; ts: number }[]> = new Map();
+  private static readonly PEER_CACHE_MAX = 50_000;
+  private static readonly PEER_CACHE_TTL = 5 * 60_000; // 5 minutes
 
   constructor(port: number, onInfohash: (infohash: string) => void) {
     this.nodeId = randomBytes(20);
@@ -137,6 +141,7 @@ export class DHTListener {
       this.bootstrap();
       setInterval(() => this.expandRoutingTable(), FIND_NODE_INTERVAL);
       setInterval(() => this.activeCrawl(), CRAWL_INTERVAL);
+      setInterval(() => this.cleanPeerCache(), 60_000); // Clean stale peers every minute
     });
   }
 
@@ -298,6 +303,25 @@ export class DHTListener {
       // If response contains "values", peers exist for this infohash — it's active
       if (Array.isArray(r.values) && r.values.length > 0) {
         this.recordInfohash(pendingHash);
+        // Parse compact peer info (6 bytes each: 4 IP + 2 port) and cache
+        const now = Date.now();
+        const peers = this.peerCache.get(pendingHash) || [];
+        for (const val of r.values) {
+          if (Buffer.isBuffer(val) && val.length === 6) {
+            const host = `${val[0]}.${val[1]}.${val[2]}.${val[3]}`;
+            const port = val.readUInt16BE(4);
+            if (port > 0 && port < 65536 && host !== '0.0.0.0') {
+              // Avoid duplicates
+              if (!peers.some(p => p.host === host && p.port === port)) {
+                peers.push({ host, port, ts: now });
+              }
+            }
+          }
+        }
+        if (peers.length > 0) {
+          this.peerCache.set(pendingHash, peers);
+          this.evictPeerCacheIfNeeded();
+        }
       }
     }
   }
@@ -333,6 +357,18 @@ export class DHTListener {
       // Someone is announcing they have this torrent — confirmed active torrent
       const infohash = a.info_hash.toString('hex');
       this.recordInfohash(infohash);
+
+      // The announcing node IS a peer — cache it
+      // BEP-5: if implied_port is set, use UDP source port; otherwise use a.port
+      const peerPort = a.implied_port ? rinfo.port : (typeof a.port === 'number' ? a.port : rinfo.port);
+      if (peerPort > 0 && peerPort < 65536) {
+        const peers = this.peerCache.get(infohash) || [];
+        if (!peers.some(p => p.host === rinfo.address && p.port === peerPort)) {
+          peers.push({ host: rinfo.address, port: peerPort, ts: Date.now() });
+          this.peerCache.set(infohash, peers);
+          this.evictPeerCacheIfNeeded();
+        }
+      }
 
       // Acknowledge
       this.send({
@@ -435,6 +471,36 @@ export class DHTListener {
     const nodes = [...this.routingTable.values()];
     const shuffled = nodes.sort(() => Math.random() - 0.5);
     return shuffled.slice(0, count).map(n => ({ host: n.host, port: n.port }));
+  }
+
+  /** Get cached peers for a specific infohash (from get_peers values + announce_peer) */
+  getPeersForHash(infohash: string): { host: string; port: number }[] {
+    const peers = this.peerCache.get(infohash);
+    if (!peers) return [];
+    const now = Date.now();
+    // Filter out stale entries
+    return peers
+      .filter(p => now - p.ts < DHTListener.PEER_CACHE_TTL)
+      .map(p => ({ host: p.host, port: p.port }));
+  }
+
+  private cleanPeerCache(): void {
+    const now = Date.now();
+    for (const [hash, peers] of this.peerCache) {
+      const fresh = peers.filter(p => now - p.ts < DHTListener.PEER_CACHE_TTL);
+      if (fresh.length === 0) {
+        this.peerCache.delete(hash);
+      } else {
+        this.peerCache.set(hash, fresh);
+      }
+    }
+  }
+
+  private evictPeerCacheIfNeeded(): void {
+    if (this.peerCache.size <= DHTListener.PEER_CACHE_MAX) return;
+    // Evict oldest entries
+    const first = this.peerCache.keys().next().value!;
+    this.peerCache.delete(first);
   }
 
   close(): void {
