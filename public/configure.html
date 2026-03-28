@@ -118,6 +118,14 @@
       <input type="number" id="maxSize" value="80" min="1" max="200">
     </div>
 
+    <div class="section">
+      <h2>Stream Mode</h2>
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="singleStream" style="width:auto;margin:0">
+        <span>Single perfect stream (return only the best match)</span>
+      </label>
+    </div>
+
     <button class="btn" onclick="generate()">Generate Addon URL</button>
 
     <div class="result" id="result">
@@ -146,6 +154,7 @@
         dubLang: document.getElementById('dubLang').value || undefined,
         subLang: document.getElementById('subLang').value || undefined,
         maxSizeGb: parseInt(document.getElementById('maxSize').value) || 80,
+        singleStream: document.getElementById('singleStream').checked || undefined,
       };
 
       // Remove undefined keys

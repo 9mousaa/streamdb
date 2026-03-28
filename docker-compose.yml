@@ -33,6 +33,13 @@ services:
       NODE_ENV: production
       LOG_LEVEL: ${LOG_LEVEL:-info}
       BASE_URL: ${BASE_URL:-https://streamdb.plaio.cc}
+      TMDB_API_KEY: ${TMDB_API_KEY:-}
+      PROBE_RD_API_KEY: ${PROBE_RD_API_KEY:-}
+      PROBE_INTERVAL_MS: ${PROBE_INTERVAL_MS:-30000}
+      DHT_ENABLED: ${DHT_ENABLED:-false}
+      DHT_PORT: ${DHT_PORT:-6881}
+    ports:
+      - "${DHT_PORT:-6881}:${DHT_PORT:-6881}/udp"
     networks:
       - streamdb-internal
       - traefik_proxy

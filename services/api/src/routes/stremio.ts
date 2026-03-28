@@ -18,6 +18,7 @@ interface UserConfig {
   dubLang?: string;
   subLang?: string;
   maxSizeGb?: number;
+  singleStream?: boolean;
 }
 
 function decodeConfig(configStr: string): UserConfig {
@@ -68,7 +69,7 @@ router.get('/:config/stream/:type/:id.json', async (req, res) => {
       return res.json({ streams: [] });
     }
 
-    const result = await getStreams(req.params.type, req.params.id, prefs, debridConfigs);
+    const result = await getStreams(req.params.type, req.params.id, prefs, debridConfigs, cfg.singleStream);
     res.json(result);
   } catch (err: any) {
     logger.error('Stream handler error', { error: err.message, id: req.params.id });

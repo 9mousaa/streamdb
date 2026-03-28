@@ -121,8 +121,8 @@ function scoreFile(file: FileRecord, prefs: UserPreferences): ScoredFile {
   const hasAll = hasPreferredAudioLang
     && (!prefs.subLang || file.subtitle_tracks.some(t => t.language === prefs.subLang));
   if (hasAll) {
-    breakdown.allInOne = 100;
-    score += 100;
+    breakdown.allInOne = 120;
+    score += 120;
   }
 
   // File size
@@ -137,10 +137,25 @@ function scoreFile(file: FileRecord, prefs: UserPreferences): ScoredFile {
     }
   }
 
-  // Metadata confidence
-  if (file.confidence >= 0.8) {
+  // Metadata confidence — probed files heavily outrank unprobed
+  if (file.confidence >= 0.9) {
+    breakdown.confidence = 15;
+    score += 15;
+  } else if (file.confidence >= 0.8) {
     breakdown.confidence = 10;
     score += 10;
+  }
+
+  // Completeness bonus — how many preferences are satisfied?
+  let satisfied = 0;
+  let total = 0;
+  if (prefs.resolutions.length) { total++; if (file.resolution && prefs.resolutions.includes(file.resolution)) satisfied++; }
+  if (prefs.hdrFormats.length) { total++; if (file.hdr && prefs.hdrFormats.map(h => h.toLowerCase()).includes(file.hdr.toLowerCase())) satisfied++; }
+  if (prefs.audioLangs.length) { total++; if (hasPreferredAudioLang) satisfied++; }
+  if (prefs.subLang) { total++; if (file.subtitle_tracks.some(t => t.language === prefs.subLang)) satisfied++; }
+  if (total > 0) {
+    breakdown.completeness = Math.round((satisfied / total) * 30);
+    score += breakdown.completeness;
   }
 
   return { file, score, breakdown };

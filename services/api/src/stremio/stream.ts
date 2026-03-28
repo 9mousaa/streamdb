@@ -1,4 +1,4 @@
-import { getFilesForContent, getFilesForEpisode } from '../db/queries/graph.js';
+import { getFilesForContent, getFilesForEpisode, queueProbeJob } from '../db/queries/graph.js';
 import { checkDebridAvailability, unrestrictRealDebrid, type DebridConfig } from '../debrid/manager.js';
 import { scoreFiles, formatStreamTitle, type UserPreferences } from './scoring.js';
 import { logger } from '../utils/logger.js';
@@ -20,7 +20,8 @@ export async function getStreams(
   type: string,
   id: string,
   prefs: UserPreferences,
-  debridConfigs: DebridConfig[]
+  debridConfigs: DebridConfig[],
+  singleStream: boolean = false
 ): Promise<StreamResult> {
   // Parse ID
   let imdbId: string;
@@ -38,6 +39,11 @@ export async function getStreams(
 
   logger.debug('Stream request', { type, imdbId, season, episode });
 
+  // Fire-and-forget TMDB enrichment if not already done
+  import('../metadata/tmdb.js').then(({ enrichContentNode }) =>
+    enrichContentNode(imdbId).catch((err: any) => logger.debug('TMDB enrich skipped', { error: err.message }))
+  );
+
   // Get all files for this content
   const files = type === 'series' && season !== undefined && episode !== undefined
     ? await getFilesForEpisode(imdbId, season, episode)
@@ -46,6 +52,13 @@ export async function getStreams(
   if (!files.length) {
     logger.debug('No files found', { imdbId });
     return { streams: [] };
+  }
+
+  // Queue probe jobs for unprobed low-confidence files
+  for (const f of files) {
+    if (f.confidence < 0.5) {
+      queueProbeJob(f.infohash, 5, 'stream_request').catch(() => {});
+    }
   }
 
   // Get unique infohashes
@@ -68,9 +81,10 @@ export async function getStreams(
   // Score and rank
   const scored = scoreFiles(cachedFiles, prefs);
 
-  // Build stream objects (top 15)
+  // Build stream objects
+  const maxStreams = singleStream ? 1 : 15;
   const streams: StremioStream[] = [];
-  for (const { file, score } of scored.slice(0, 15)) {
+  for (const { file, score } of scored.slice(0, maxStreams)) {
     const avail = availability.get(file.infohash);
     const bestService = avail?.sort((a, b) => {
       const aP = debridConfigs.find(d => d.service === a.service)?.priority ?? 99;

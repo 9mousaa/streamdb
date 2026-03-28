@@ -35,6 +35,19 @@ app.use(stremioRoutes);
 async function start() {
   try {
     await initDatabase();
+
+    // Start probe worker if RD key configured
+    if (config.probeRdApiKey) {
+      const { startProbeWorker } = await import('./probe/worker.js');
+      startProbeWorker(config.probeIntervalMs);
+    }
+
+    // Start DHT passive listener if enabled
+    if (config.dhtEnabled) {
+      const { startDHTCrawler } = await import('./crawler/processor.js');
+      startDHTCrawler();
+    }
+
     app.listen(config.port, () => {
       logger.info(`StreamDB API listening on port ${config.port}`);
     });

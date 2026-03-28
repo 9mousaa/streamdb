@@ -60,6 +60,14 @@ export async function getFilesForContent(imdbId: string): Promise<FileRecord[]> 
   return files;
 }
 
+export async function queueProbeJob(infohash: string, priority: number = 0, source: string = 'auto'): Promise<void> {
+  await pool.query(`
+    INSERT INTO probe_jobs (infohash, priority, source)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (infohash) DO NOTHING
+  `, [infohash, priority, source]);
+}
+
 export async function getFilesForEpisode(imdbId: string, season: number, episode: number): Promise<FileRecord[]> {
   // First try exact episode match
   const result = await pool.query(`
