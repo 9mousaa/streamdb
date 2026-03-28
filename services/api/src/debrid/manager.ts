@@ -241,28 +241,38 @@ async function unrestrictRdLink(link: string, apiKey: string): Promise<string | 
 
 async function unrestrictTorBox(infohash: string, fileIdx: number, apiKey: string): Promise<string | null> {
   try {
-    // Create torrent request
+    // Create torrent request — TorBox requires multipart form data
+    const formBody = new URLSearchParams();
+    formBody.set('magnet', `magnet:?xt=urn:btih:${infohash}`);
+    formBody.set('seed', '1');
+
     const createRes = await fetch('https://api.torbox.app/v1/api/torrents/createtorrent', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded',
       },
-      body: JSON.stringify({ magnet: `magnet:?xt=urn:btih:${infohash}`, seed: 1 }),
+      body: formBody.toString(),
     });
-    if (!createRes.ok) return null;
-    const createData = await createRes.json() as { data?: { torrent_id: number } };
-    const torrentId = createData.data?.torrent_id;
-    if (!torrentId) return null;
+    if (!createRes.ok) {
+      logger.warn('TorBox createtorrent failed', { status: createRes.status });
+      return null;
+    }
+    const createData = await createRes.json() as { success?: boolean; data?: { torrent_id: number } };
+    if (!createData.success || !createData.data?.torrent_id) return null;
+    const torrentId = createData.data.torrent_id;
 
     // Request download link
     const dlRes = await fetch(
       `https://api.torbox.app/v1/api/torrents/requestdl?torrent_id=${torrentId}&file_id=${fileIdx}&zip_link=false`,
       { headers: { 'Authorization': `Bearer ${apiKey}` } }
     );
-    if (!dlRes.ok) return null;
-    const dlData = await dlRes.json() as { data?: string };
-    return dlData.data || null;
+    if (!dlRes.ok) {
+      logger.warn('TorBox requestdl failed', { status: dlRes.status, torrentId });
+      return null;
+    }
+    const dlData = await dlRes.json() as { success?: boolean; data?: string };
+    return dlData.success && dlData.data ? dlData.data : null;
   } catch (err: any) {
     logger.error('TorBox unrestrict failed', { error: err.message });
     return null;
