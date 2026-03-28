@@ -40,7 +40,7 @@ services:
       - "traefik.enable=true"
       - "traefik.http.routers.streamdb.rule=Host(`streamdb.plaio.cc`)"
       - "traefik.http.routers.streamdb.entrypoints=websecure"
-      - "traefik.http.routers.streamdb.tls.certresolver=myresolver"
+      - "traefik.http.routers.streamdb.tls.certresolver=letsencrypt"
       - "traefik.http.services.streamdb.loadbalancer.server.port=3000"
 
 volumes:
