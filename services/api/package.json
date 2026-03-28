@@ -10,8 +10,7 @@
   },
   "dependencies": {
     "express": "^4.21.2",
-    "pg": "^8.13.1",
-    "parse-torrent-title": "^0.7.1"
+    "pg": "^8.13.1"
   },
   "devDependencies": {
     "@types/express": "^5.0.0",
