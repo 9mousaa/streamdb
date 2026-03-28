@@ -23,9 +23,10 @@ const BOOTSTRAP_NODES = [
   { host: 'dht.libtorrent.org', port: 25401 },
 ];
 
-const MAX_ROUTING_TABLE = 1000;
+const MAX_ROUTING_TABLE = 5000;
 const FIND_NODE_INTERVAL = 5000; // 5s between find_node bursts
-const MAX_INFOHASH_BUFFER = 10000;
+const CRAWL_INTERVAL = 1000; // 1s between active crawl rounds
+const MAX_INFOHASH_BUFFER = 50000;
 
 interface DHTNode {
   id: Buffer;
@@ -119,6 +120,9 @@ export class DHTListener {
   private transactionCounter = 0;
   private infohashBuffer: Set<string> = new Set();
   private onInfohash: (infohash: string) => void;
+  // Track pending get_peers transactions → infohash they were looking for
+  private pendingGetPeers: Map<string, string> = new Map();
+  private crawlPosition: number = 0; // For systematic keyspace walking
 
   constructor(port: number, onInfohash: (infohash: string) => void) {
     this.nodeId = randomBytes(20);
@@ -132,6 +136,7 @@ export class DHTListener {
       logger.info('DHT listener started', { port, nodeId: this.nodeId.toString('hex').substring(0, 8) });
       this.bootstrap();
       setInterval(() => this.expandRoutingTable(), FIND_NODE_INTERVAL);
+      setInterval(() => this.activeCrawl(), CRAWL_INTERVAL);
     });
   }
 
@@ -183,6 +188,73 @@ export class DHTListener {
     }
   }
 
+  private sendGetPeers(host: string, port: number, infohash: Buffer): void {
+    const txId = this.nextTxId();
+    const txKey = txId.toString('hex');
+    this.pendingGetPeers.set(txKey, infohash.toString('hex'));
+    // Clean up old pending entries (prevent memory leak)
+    if (this.pendingGetPeers.size > 10000) {
+      const first = this.pendingGetPeers.keys().next().value!;
+      this.pendingGetPeers.delete(first);
+    }
+    this.send({
+      t: txId,
+      y: 'q',
+      q: 'get_peers',
+      a: { id: this.nodeId, info_hash: infohash },
+    }, host, port);
+  }
+
+  /**
+   * Active DHT crawling — systematically walk the keyspace.
+   * Generates targets across the full 160-bit hash space and sends
+   * get_peers queries to discover infohashes being actively used.
+   */
+  private activeCrawl(): void {
+    const nodes = [...this.routingTable.values()];
+    if (nodes.length < 10) return; // Wait until we have enough nodes
+
+    // Walk the keyspace: generate a target with the high byte set to crawlPosition
+    // This ensures we systematically cover different regions of the hash space
+    const target = randomBytes(20);
+    target[0] = this.crawlPosition & 0xff;
+    target[1] = (this.crawlPosition >> 8) & 0xff;
+    this.crawlPosition = (this.crawlPosition + 1) % 65536;
+
+    // Send get_peers to the closest nodes we know
+    const sorted = this.closestNodes(target, 6);
+    for (const node of sorted) {
+      this.sendGetPeers(node.host, node.port, target);
+    }
+  }
+
+  /**
+   * Find peers for a specific infohash (used by probe pipeline).
+   * Returns found peers via the onInfohash callback.
+   */
+  crawlTargeted(infohash: string): void {
+    const target = Buffer.from(infohash, 'hex');
+    if (target.length !== 20) return;
+    const closest = this.closestNodes(target, 8);
+    for (const node of closest) {
+      this.sendGetPeers(node.host, node.port, target);
+    }
+  }
+
+  private closestNodes(target: Buffer, count: number): DHTNode[] {
+    const nodes = [...this.routingTable.values()];
+    // Sort by XOR distance to target
+    nodes.sort((a, b) => {
+      for (let i = 0; i < 20; i++) {
+        const da = a.id[i] ^ target[i];
+        const db = b.id[i] ^ target[i];
+        if (da !== db) return da - db;
+      }
+      return 0;
+    });
+    return nodes.slice(0, count);
+  }
+
   private handleMessage(msg: Buffer, rinfo: RemoteInfo): void {
     let decoded: any;
     try {
@@ -216,6 +288,17 @@ export class DHTListener {
     // Parse compact node info from "nodes" field
     if (Buffer.isBuffer(r.nodes) && r.nodes.length >= 26) {
       this.parseCompactNodes(r.nodes);
+    }
+
+    // Handle get_peers response — if values present, the infohash is active
+    const txKey = Buffer.isBuffer(msg.t) ? msg.t.toString('hex') : '';
+    const pendingHash = this.pendingGetPeers.get(txKey);
+    if (pendingHash) {
+      this.pendingGetPeers.delete(txKey);
+      // If response contains "values", peers exist for this infohash — it's active
+      if (Array.isArray(r.values) && r.values.length > 0) {
+        this.recordInfohash(pendingHash);
+      }
     }
   }
 
@@ -345,6 +428,13 @@ export class DHTListener {
       routingTableSize: this.routingTable.size,
       infohashesDiscovered: this.infohashBuffer.size,
     };
+  }
+
+  /** Get routing table nodes as potential peers for BEP-9 metadata fetching */
+  getRoutingNodes(count: number): { host: string; port: number }[] {
+    const nodes = [...this.routingTable.values()];
+    const shuffled = nodes.sort(() => Math.random() - 0.5);
+    return shuffled.slice(0, count).map(n => ({ host: n.host, port: n.port }));
   }
 
   close(): void {

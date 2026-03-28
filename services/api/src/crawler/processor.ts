@@ -15,8 +15,8 @@ import { logger } from '../utils/logger.js';
 import { DHTListener } from './dht.js';
 import { config } from '../config.js';
 
-const FLUSH_INTERVAL = 30_000; // Flush to DB every 30s
-const MAX_BATCH = 500;
+const FLUSH_INTERVAL = 15_000; // Flush to DB every 15s (higher throughput with active crawl)
+const MAX_BATCH = 2000;
 
 let pendingHashes: string[] = [];
 let dhtListener: DHTListener | null = null;
@@ -95,4 +95,9 @@ export function getDHTStats(): { routingTableSize: number; infohashesDiscovered:
     ...dhtListener.getStats(),
     pendingFlush: pendingHashes.length,
   };
+}
+
+/** Get the DHT listener instance (for targeted crawling from probe worker) */
+export function getDHTListener(): DHTListener | null {
+  return dhtListener;
 }

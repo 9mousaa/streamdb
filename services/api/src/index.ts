@@ -38,8 +38,8 @@ async function start() {
   try {
     await initDatabase();
 
-    // Start probe worker if RD key configured
-    if (config.probeRdApiKey) {
+    // Start probe worker (torrent-based, uses DHT for peer discovery)
+    if (config.dhtEnabled) {
       const { startProbeWorker } = await import('./probe/worker.js');
       startProbeWorker(config.probeIntervalMs);
     }
@@ -48,6 +48,12 @@ async function start() {
     if (config.dhtEnabled) {
       const { startDHTCrawler } = await import('./crawler/processor.js');
       startDHTCrawler();
+    }
+
+    // Start reference frame builder (for phash content matching)
+    {
+      const { startReferenceBuilder } = await import('./recognition/build-references.js');
+      startReferenceBuilder();
     }
 
     app.listen(config.port, () => {
