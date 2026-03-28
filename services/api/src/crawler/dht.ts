@@ -127,6 +127,8 @@ export class DHTListener {
   private peerCache: Map<string, { host: string; port: number; ts: number }[]> = new Map();
   private static readonly PEER_CACHE_MAX = 50_000;
   private static readonly PEER_CACHE_TTL = 5 * 60_000; // 5 minutes
+  // Per-transaction callbacks for iterative lookups
+  private txCallbacks: Map<string, (r: any, rinfo: RemoteInfo) => void> = new Map();
 
   constructor(port: number, onInfohash: (infohash: string) => void) {
     this.nodeId = randomBytes(20);
@@ -295,8 +297,15 @@ export class DHTListener {
       this.parseCompactNodes(r.nodes);
     }
 
-    // Handle get_peers response — if values present, the infohash is active
+    // Check for iterative lookup callbacks first
     const txKey = Buffer.isBuffer(msg.t) ? msg.t.toString('hex') : '';
+    const cb = this.txCallbacks.get(txKey);
+    if (cb) {
+      cb(r, rinfo);
+      // Don't return — still process nodes/values for background caching
+    }
+
+    // Handle get_peers response — if values present, the infohash is active
     const pendingHash = this.pendingGetPeers.get(txKey);
     if (pendingHash) {
       this.pendingGetPeers.delete(txKey);
@@ -471,6 +480,150 @@ export class DHTListener {
     const nodes = [...this.routingTable.values()];
     const shuffled = nodes.sort(() => Math.random() - 0.5);
     return shuffled.slice(0, count).map(n => ({ host: n.host, port: n.port }));
+  }
+
+  /**
+   * Iterative DHT lookup — proper BEP-5 Kademlia-style peer discovery.
+   * Sends get_peers, follows nodes responses to get closer, collects peers.
+   * Typically takes 3-5 rounds, ~10-20 seconds.
+   */
+  findPeersForHash(infohash: string): Promise<{ host: string; port: number }[]> {
+    const target = Buffer.from(infohash, 'hex');
+    if (target.length !== 20) return Promise.resolve([]);
+
+    const ALPHA = 8;       // Parallel queries per round
+    const MAX_ROUNDS = 5;
+    const ROUND_TIMEOUT = 3000; // 3s per round
+    const foundPeers: Map<string, { host: string; port: number }> = new Map();
+    const queried = new Set<string>();      // "host:port" we already sent to
+    // Candidate nodes sorted by distance, to query in next round
+    let candidates: { host: string; port: number; id: Buffer }[] =
+      this.closestNodes(target, ALPHA * 2).map(n => ({ host: n.host, port: n.port, id: n.id }));
+
+    return new Promise<{ host: string; port: number }[]>(resolve => {
+      let round = 0;
+
+      const runRound = () => {
+        if (round >= MAX_ROUNDS || foundPeers.size > 0) {
+          // We either have peers or exhausted rounds
+          if (foundPeers.size > 0) {
+            // Also cache them
+            const now = Date.now();
+            const cached = this.peerCache.get(infohash) || [];
+            for (const p of foundPeers.values()) {
+              if (!cached.some(c => c.host === p.host && c.port === p.port)) {
+                cached.push({ host: p.host, port: p.port, ts: now });
+              }
+            }
+            this.peerCache.set(infohash, cached);
+            this.evictPeerCacheIfNeeded();
+          }
+          resolve([...foundPeers.values()]);
+          return;
+        }
+
+        // Pick up to ALPHA unqueried candidates
+        const toQuery = candidates
+          .filter(c => !queried.has(`${c.host}:${c.port}`))
+          .slice(0, ALPHA);
+
+        if (toQuery.length === 0) {
+          resolve([...foundPeers.values()]);
+          return;
+        }
+
+        let responsesLeft = toQuery.length;
+        const newNodes: { host: string; port: number; id: Buffer }[] = [];
+
+        const onAllDone = () => {
+          // Sort new candidates by XOR distance and merge
+          for (const n of newNodes) {
+            const key = `${n.host}:${n.port}`;
+            if (!queried.has(key) && !candidates.some(c => c.host === n.host && c.port === n.port)) {
+              candidates.push(n);
+            }
+          }
+          candidates.sort((a, b) => {
+            for (let i = 0; i < 20; i++) {
+              const da = a.id[i] ^ target[i];
+              const db = b.id[i] ^ target[i];
+              if (da !== db) return da - db;
+            }
+            return 0;
+          });
+          round++;
+          // If we found peers this round, resolve immediately
+          if (foundPeers.size > 0) {
+            runRound(); // Will resolve at the top
+          } else {
+            runRound();
+          }
+        };
+
+        let roundDone = false;
+        const roundTimer = setTimeout(() => {
+          if (!roundDone) {
+            roundDone = true;
+            onAllDone();
+          }
+        }, ROUND_TIMEOUT);
+
+        for (const node of toQuery) {
+          queried.add(`${node.host}:${node.port}`);
+
+          const txId = this.nextTxId();
+          const txKey = txId.toString('hex');
+
+          this.txCallbacks.set(txKey, (r: any, _rinfo: RemoteInfo) => {
+            this.txCallbacks.delete(txKey);
+
+            // Parse peers from values
+            if (Array.isArray(r.values)) {
+              for (const val of r.values) {
+                if (Buffer.isBuffer(val) && val.length === 6) {
+                  const host = `${val[0]}.${val[1]}.${val[2]}.${val[3]}`;
+                  const port = val.readUInt16BE(4);
+                  if (port > 0 && port < 65536 && host !== '0.0.0.0') {
+                    foundPeers.set(`${host}:${port}`, { host, port });
+                  }
+                }
+              }
+            }
+
+            // Parse closer nodes
+            if (Buffer.isBuffer(r.nodes) && r.nodes.length >= 26) {
+              for (let i = 0; i + 26 <= r.nodes.length; i += 26) {
+                const id = Buffer.from(r.nodes.subarray(i, i + 20));
+                const ip = `${r.nodes[i + 20]}.${r.nodes[i + 21]}.${r.nodes[i + 22]}.${r.nodes[i + 23]}`;
+                const p = r.nodes.readUInt16BE(i + 24);
+                if (p > 0 && p < 65536 && ip !== '0.0.0.0' && ip !== '127.0.0.1') {
+                  newNodes.push({ host: ip, port: p, id });
+                  // Also add to our routing table
+                  this.addNode(id, ip, p);
+                }
+              }
+            }
+
+            responsesLeft--;
+            if (responsesLeft <= 0 && !roundDone) {
+              roundDone = true;
+              clearTimeout(roundTimer);
+              onAllDone();
+            }
+          });
+
+          // Send get_peers with the callback-tracked txId
+          this.send({
+            t: txId,
+            y: 'q',
+            q: 'get_peers',
+            a: { id: this.nodeId, info_hash: target },
+          }, node.host, node.port);
+        }
+      };
+
+      runRound();
+    });
   }
 
   /** Get cached peers for a specific infohash (from get_peers values + announce_peer) */

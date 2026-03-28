@@ -151,38 +151,27 @@ async function processNextJob(): Promise<void> {
 
 /**
  * Find peers for an infohash using the DHT network.
- * Sends targeted get_peers queries and waits for actual peer responses.
+ * First checks cache, then does an iterative BEP-5 lookup (~10-20s).
  */
 async function findPeers(infohash: string): Promise<Peer[]> {
   const dht = getDHTListener();
   if (!dht) return [];
 
   // Check if we already have cached peers from prior DHT activity
-  let peers = dht.getPeersForHash(infohash);
+  const cached = dht.getPeersForHash(infohash);
+  if (cached.length > 0) {
+    logger.info('Found cached peers', { infohash: infohash.substring(0, 8), count: cached.length });
+    return cached;
+  }
+
+  // Do a proper iterative DHT lookup (3-5 rounds, ~10-20s)
+  const peers = await dht.findPeersForHash(infohash);
   if (peers.length > 0) {
-    logger.debug('Found cached peers for infohash', { infohash, count: peers.length });
-    return peers;
+    logger.info('Found peers via DHT lookup', { infohash: infohash.substring(0, 8), count: peers.length });
+  } else {
+    logger.info('No peers found for hash', { infohash: infohash.substring(0, 8) });
   }
-
-  // Send targeted crawl requests to find peers
-  dht.crawlTargeted(infohash);
-
-  // Wait for get_peers responses to arrive with peer lists
-  await new Promise(r => setTimeout(r, 5000));
-
-  // Check again after DHT responses
-  peers = dht.getPeersForHash(infohash);
-  if (peers.length > 0) {
-    logger.debug('Found peers after DHT crawl', { infohash, count: peers.length });
-    return peers;
-  }
-
-  // Last resort: try a few routing table nodes (some may support BEP-9)
-  const fallback = dht.getRoutingNodes(5);
-  if (fallback.length > 0) {
-    logger.debug('No real peers found, trying routing table fallback', { infohash, count: fallback.length });
-  }
-  return fallback;
+  return peers;
 }
 
 function findBestVideoFile(files: { path: string; size: number }[]): { path: string; size: number } | null {
