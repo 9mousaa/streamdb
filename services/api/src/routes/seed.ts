@@ -9,16 +9,37 @@ const router = Router();
 let seedingInProgress = false;
 let seedProgress = { phase: '', processed: 0, total: 0, files: 0, matched: 0 };
 
-router.post('/api/seed', async (_req, res) => {
+router.post('/api/seed', async (req, res) => {
   if (seedingInProgress) {
     return res.json({ status: 'already_running', progress: seedProgress });
   }
+
+  // Accept TMDB key via POST body (overrides env)
+  const tmdbKey = req.body?.tmdb_api_key || config.tmdbApiKey;
 
   seedingInProgress = true;
   seedProgress = { phase: 'starting', processed: 0, total: 0, files: 0, matched: 0 };
   res.json({ status: 'started' });
 
-  runSeedPipeline().finally(() => { seedingInProgress = false; });
+  runSeedPipeline(tmdbKey).finally(() => { seedingInProgress = false; });
+});
+
+// Phase 2 only — match already-imported files to IMDB via TMDB
+router.post('/api/seed/match', async (req, res) => {
+  if (seedingInProgress) {
+    return res.json({ status: 'already_running', progress: seedProgress });
+  }
+
+  const tmdbKey = req.body?.tmdb_api_key || config.tmdbApiKey;
+  if (!tmdbKey) {
+    return res.status(400).json({ error: 'TMDB API key required (pass tmdb_api_key in body or set TMDB_API_KEY env)' });
+  }
+
+  seedingInProgress = true;
+  seedProgress = { phase: 'matching_imdb', processed: 0, total: 0, files: 0, matched: 0 };
+  res.json({ status: 'started', phase: 'match_only' });
+
+  runMatchPhase(tmdbKey).finally(() => { seedingInProgress = false; });
 });
 
 // Accept bulk hash data via POST
@@ -181,11 +202,9 @@ function decompressDMMHtml(html: string): RawHashEntry[] {
 
 // ── TMDB Title Search ─────────────────────────────────────────
 
-async function searchTMDB(title: string, year: number | null, type: 'movie' | 'tv'): Promise<string | null> {
-  if (!config.tmdbApiKey) return null;
-
+async function searchTMDB(title: string, year: number | null, type: 'movie' | 'tv', apiKey: string): Promise<string | null> {
   const params = new URLSearchParams({
-    api_key: config.tmdbApiKey,
+    api_key: apiKey,
     query: title,
     ...(year ? { year: year.toString() } : {}),
   });
@@ -195,9 +214,8 @@ async function searchTMDB(title: string, year: number | null, type: 'movie' | 't
   if (!data?.results?.length) return null;
 
   const tmdbId = data.results[0].id;
-  // Get external IDs for IMDB
   const extPath = type === 'tv' ? `/tv/${tmdbId}/external_ids` : `/movie/${tmdbId}/external_ids`;
-  const ext = await fetchJson(`https://api.themoviedb.org/3${extPath}?api_key=${config.tmdbApiKey}`);
+  const ext = await fetchJson(`https://api.themoviedb.org/3${extPath}?api_key=${apiKey}`);
   return ext?.imdb_id || null;
 }
 
@@ -206,7 +224,92 @@ async function searchTMDB(title: string, year: number | null, type: 'movie' | 't
 const DMM_GITHUB_API = 'https://api.github.com/repos/debridmediamanager/hashlists/contents';
 const DMM_RAW_BASE = 'https://raw.githubusercontent.com/debridmediamanager/hashlists/main';
 
-async function runSeedPipeline() {
+async function runMatchPhase(tmdbKey: string) {
+  const client = await pool.connect();
+  let totalMatched = 0;
+
+  try {
+    logger.info('Seed Match: Starting TMDB matching for unmatched files');
+    const totalFiles = (await pool.query('SELECT COUNT(*)::int as c FROM files')).rows[0].c;
+
+    const unmatched = await client.query(`
+      SELECT f.id, f.filename, f.infohash
+      FROM files f
+      LEFT JOIN content_files cf ON cf.file_id = f.id
+      WHERE cf.file_id IS NULL AND f.filename != ''
+      ORDER BY f.file_size DESC NULLS LAST
+      LIMIT 10000
+    `);
+
+    seedProgress = { phase: 'matching_imdb', processed: 0, total: unmatched.rows.length, files: totalFiles, matched: 0 };
+    logger.info(`Seed Match: ${unmatched.rows.length} unmatched files`);
+
+    const titleCache = new Map<string, string | null>();
+    let batchIdx = 0;
+    await client.query('BEGIN');
+
+    for (let i = 0; i < unmatched.rows.length; i++) {
+      const row = unmatched.rows[i];
+      const parsed = parseTitle(row.filename);
+      if (!parsed.cleanTitle || parsed.cleanTitle.length < 2) continue;
+
+      const searchKey = `${parsed.cleanTitle}|${parsed.year || ''}`;
+
+      let imdbId: string | null;
+      if (titleCache.has(searchKey)) {
+        imdbId = titleCache.get(searchKey) || null;
+      } else {
+        const type = parsed.isEpisode ? 'tv' : 'movie';
+        imdbId = await searchTMDB(parsed.cleanTitle, parsed.year, type, tmdbKey);
+        titleCache.set(searchKey, imdbId);
+        await sleep(250);
+      }
+
+      if (imdbId) {
+        const cr = await client.query(`
+          INSERT INTO content (imdb_id, type, title, year)
+          VALUES ($1, $2, $3, $4)
+          ON CONFLICT (imdb_id) DO UPDATE SET updated_at = NOW()
+          RETURNING id
+        `, [imdbId, parsed.isEpisode ? 'series' : 'movie', parsed.cleanTitle, parsed.year]);
+
+        if (cr.rows[0]) {
+          await client.query(`
+            INSERT INTO content_files (content_id, file_id, match_method, confidence)
+            VALUES ($1, $2, 'tmdb_title_search', 0.6)
+            ON CONFLICT DO NOTHING
+          `, [cr.rows[0].id, row.id]);
+        }
+        totalMatched++;
+        batchIdx++;
+      }
+
+      if (batchIdx >= 200) {
+        await client.query('COMMIT');
+        await client.query('BEGIN');
+        batchIdx = 0;
+      }
+
+      seedProgress = { phase: 'matching_imdb', processed: i + 1, total: unmatched.rows.length, files: totalFiles, matched: totalMatched };
+
+      if ((i + 1) % 200 === 0) {
+        logger.info(`Seed Match: ${totalMatched}/${i + 1} matched (${titleCache.size} unique titles)`);
+      }
+    }
+
+    await client.query('COMMIT');
+    seedProgress = { ...seedProgress, phase: 'complete' };
+    logger.info(`Seed Match complete: ${totalMatched} files matched to IMDB IDs`);
+  } catch (err: any) {
+    try { await client.query('ROLLBACK'); } catch {}
+    logger.error('Seed Match error', { error: err.message });
+    seedProgress = { ...seedProgress, phase: 'error' };
+  } finally {
+    client.release();
+  }
+}
+
+async function runSeedPipeline(tmdbKey: string) {
   const client = await pool.connect();
   let totalFiles = 0;
   let totalMatched = 0;
@@ -291,7 +394,7 @@ async function runSeedPipeline() {
     logger.info(`Seed Phase 1 complete: ${totalFiles.toLocaleString()} hashes imported from ${dmmFiles.length} files`);
 
     // ═══ PHASE 2: Match filenames to IMDB IDs via TMDB ═══
-    if (config.tmdbApiKey) {
+    if (tmdbKey) {
       logger.info('Seed Phase 2: Matching filenames to IMDB IDs via TMDB');
       seedProgress = { phase: 'matching_imdb', processed: 0, total: 0, files: totalFiles, matched: 0 };
 
@@ -323,9 +426,9 @@ async function runSeedPipeline() {
           imdbId = titleCache.get(searchKey) || null;
         } else {
           const type = parsed.isEpisode ? 'tv' : 'movie';
-          imdbId = await searchTMDB(parsed.cleanTitle, parsed.year, type);
+          imdbId = await searchTMDB(parsed.cleanTitle, parsed.year, type, tmdbKey);
           titleCache.set(searchKey, imdbId);
-          await sleep(300); // TMDB rate limit: ~40 req/s
+          await sleep(250); // TMDB rate limit: ~40 req/s
         }
 
         if (imdbId) {
