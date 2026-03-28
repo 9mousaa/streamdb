@@ -36,6 +36,26 @@ router.get('/api/stats', async (_req, res) => {
   }
 });
 
+// Debug: check what data exists for an IMDB ID
+router.get('/api/debug/:imdbId', async (req, res) => {
+  try {
+    const imdbId = req.params.imdbId;
+    const content = await pool.query('SELECT * FROM content WHERE imdb_id = $1', [imdbId]);
+    const files = await pool.query(`
+      SELECT f.infohash, f.file_idx, f.filename, f.file_size, f.resolution, f.video_codec, f.hdr, f.metadata_src, f.confidence, cf.match_method
+      FROM files f JOIN content_files cf ON cf.file_id = f.id JOIN content c ON c.id = cf.content_id
+      WHERE c.imdb_id = $1 ORDER BY f.confidence DESC LIMIT 20
+    `, [imdbId]);
+    const debrid = await pool.query(`
+      SELECT dc.infohash, dc.service, dc.available, dc.expires_at
+      FROM debrid_cache dc WHERE dc.infohash = ANY(SELECT f.infohash FROM files f JOIN content_files cf ON cf.file_id = f.id JOIN content c ON c.id = cf.content_id WHERE c.imdb_id = $1)
+    `, [imdbId]);
+    res.json({ content: content.rows, files: files.rows, debridCache: debrid.rows });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Debug: recently probed jobs
 router.get('/api/probes', async (req, res) => {
   try {
