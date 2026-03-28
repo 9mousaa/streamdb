@@ -2,25 +2,26 @@ import { Router } from 'express';
 import { pool } from '../db/pool.js';
 import { logger } from '../utils/logger.js';
 import { decompressFromBase64 } from '../utils/lz-string.js';
+import { config } from '../config.js';
 
 const router = Router();
 
 let seedingInProgress = false;
-let seedProgress = { phase: '', processed: 0, total: 0 };
+let seedProgress = { phase: '', processed: 0, total: 0, files: 0, matched: 0 };
 
-router.post('/api/seed', async (req, res) => {
+router.post('/api/seed', async (_req, res) => {
   if (seedingInProgress) {
     return res.json({ status: 'already_running', progress: seedProgress });
   }
 
   seedingInProgress = true;
-  seedProgress = { phase: 'starting', processed: 0, total: 0 };
+  seedProgress = { phase: 'starting', processed: 0, total: 0, files: 0, matched: 0 };
   res.json({ status: 'started' });
 
-  seedFromDMM().finally(() => { seedingInProgress = false; });
+  runSeedPipeline().finally(() => { seedingInProgress = false; });
 });
 
-// Accept bulk hash data via POST (for external scripts to push data in)
+// Accept bulk hash data via POST
 router.post('/api/seed/bulk', async (req, res) => {
   const entries = req.body?.entries;
   if (!Array.isArray(entries)) {
@@ -32,7 +33,6 @@ router.post('/api/seed/bulk', async (req, res) => {
 
   try {
     await client.query('BEGIN');
-
     for (const entry of entries) {
       const hash = (entry.hash || '').toLowerCase();
       if (!hash || hash.length !== 40) continue;
@@ -40,38 +40,20 @@ router.post('/api/seed/bulk', async (req, res) => {
       if (!imdb.startsWith('tt')) continue;
 
       const parsed = parseTitle(entry.title || '');
+      await client.query(`INSERT INTO files (infohash, file_idx, filename, file_size, torrent_name, resolution, video_codec, hdr, metadata_src, confidence) VALUES ($1, 0, $2, $3, $4, $5, $6, $7, 'bulk_seed', 0.4) ON CONFLICT (infohash, file_idx) DO NOTHING`,
+        [hash, entry.title || '', entry.size || null, entry.title || '', parsed.resolution, parsed.codec, parsed.hdr]);
 
-      await client.query(`
-        INSERT INTO files (infohash, file_idx, filename, file_size, torrent_name, resolution, video_codec, hdr, metadata_src, confidence)
-        VALUES ($1, 0, $2, $3, $4, $5, $6, $7, 'bulk_seed', 0.4)
-        ON CONFLICT (infohash, file_idx) DO NOTHING
-      `, [hash, entry.title || '', entry.size || null, entry.title || '', parsed.resolution, parsed.codec, parsed.hdr]);
-
-      const cr = await client.query(`
-        INSERT INTO content (imdb_id, type, title)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (imdb_id) DO UPDATE SET updated_at = NOW()
-        RETURNING id
-      `, [imdb, parsed.isEpisode ? 'episode' : 'movie', entry.title || imdb]);
+      const cr = await client.query(`INSERT INTO content (imdb_id, type, title) VALUES ($1, $2, $3) ON CONFLICT (imdb_id) DO UPDATE SET updated_at = NOW() RETURNING id`,
+        [imdb, parsed.isEpisode ? 'episode' : 'movie', entry.title || imdb]);
 
       const fr = await client.query('SELECT id FROM files WHERE infohash = $1 AND file_idx = 0', [hash]);
       if (fr.rows[0] && cr.rows[0]) {
-        await client.query(`
-          INSERT INTO content_files (content_id, file_id, match_method, confidence)
-          VALUES ($1, $2, 'bulk_seed', 0.7)
-          ON CONFLICT DO NOTHING
-        `, [cr.rows[0].id, fr.rows[0].id]);
+        await client.query(`INSERT INTO content_files (content_id, file_id, match_method, confidence) VALUES ($1, $2, 'bulk_seed', 0.7) ON CONFLICT DO NOTHING`,
+          [cr.rows[0].id, fr.rows[0].id]);
       }
-
-      await client.query(`
-        INSERT INTO probe_jobs (infohash, priority, source)
-        VALUES ($1, 1, 'bulk_seed')
-        ON CONFLICT (infohash) DO NOTHING
-      `, [hash]);
-
+      await client.query(`INSERT INTO probe_jobs (infohash, priority, source) VALUES ($1, 1, 'bulk_seed') ON CONFLICT (infohash) DO NOTHING`, [hash]);
       imported++;
     }
-
     await client.query('COMMIT');
     res.json({ imported });
   } catch (err: any) {
@@ -97,7 +79,7 @@ router.get('/api/seed/status', async (_req, res) => {
   }
 });
 
-// ── Title parser ──────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────
 
 function parseTitle(name: string) {
   let resolution: string | null = null;
@@ -119,13 +101,16 @@ function parseTitle(name: string) {
   const seMatch = name.match(/S(\d{1,2})E(\d{1,3})/i);
   const isEpisode = seMatch !== null;
 
-  return { resolution, codec, hdr, isEpisode };
+  // Extract clean title and year
+  const yearMatch = name.match(/[\.\s\(]?((?:19|20)\d{2})[\.\s\)]/);
+  const year = yearMatch ? parseInt(yearMatch[1]) : null;
+  let cleanTitle = name.split(/[\.\s](?:(?:19|20)\d{2}|S\d{2}|2160p|1080p|720p|480p)/i)[0] || name;
+  cleanTitle = cleanTitle.replace(/\./g, ' ').trim();
+
+  return { resolution, codec, hdr, isEpisode, cleanTitle, year };
 }
 
-// ── DMM Hashlist Seeder ───────────────────────────────────────
-
-const DMM_GITHUB_API = 'https://api.github.com/repos/debridmediamanager/hashlists/contents';
-const DMM_RAW_BASE = 'https://raw.githubusercontent.com/debridmediamanager/hashlists/main';
+function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
 async function fetchText(url: string): Promise<string | null> {
   for (let i = 0; i < 3; i++) {
@@ -147,250 +132,248 @@ async function fetchText(url: string): Promise<string | null> {
   return null;
 }
 
-function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
+async function fetchJson(url: string): Promise<any> {
+  const text = await fetchText(url);
+  if (!text) return null;
+  try { return JSON.parse(text); } catch { return null; }
+}
 
-interface DMMHashEntry {
+// ── DMM Decompression ─────────────────────────────────────────
+
+interface RawHashEntry {
   filename: string;
   hash: string;
   bytes: number;
 }
 
-interface DMMParsedResult {
-  // Map of IMDB ID -> entries
-  byImdb: Map<string, DMMHashEntry[]>;
-}
-
-function parseDMMHtml(html: string): DMMParsedResult {
-  const result: DMMParsedResult = { byImdb: new Map() };
-
-  // Extract the LZ-string data from iframe src after #
+function decompressDMMHtml(html: string): RawHashEntry[] {
   const match = html.match(/src="[^"]*#([^"]+)"/);
-  if (!match) return result;
+  if (!match) return [];
 
-  const compressed = match[1];
-  const decompressed = decompressFromBase64(compressed);
-  if (!decompressed) return result;
+  const decompressed = decompressFromBase64(match[1]);
+  if (!decompressed) return [];
 
   try {
     const data = JSON.parse(decompressed);
+    // DMM format: array or pseudo-array of { filename, hash, bytes }
+    const items = Array.isArray(data)
+      ? data
+      : (typeof data === 'object' && data['0'] !== undefined)
+        ? Object.values(data)
+        : [];
 
-    // DMM hashlists can have various formats:
-    // 1. { "tt1234567": [...hashes...], "tt2345678": [...] } — keyed by IMDB
-    // 2. { imdbId: "tt...", files: [...] }
-    // 3. Array of { hash, filename, imdb?, ... }
-    // 4. { files: [{ hash, filename, ... }] } with top-level imdbId
-
-    if (Array.isArray(data)) {
-      // Array format — group by IMDB if present
-      for (const entry of data) {
-        const hash = (entry.hash || entry.infohash || '').toLowerCase();
-        if (!hash || hash.length !== 40) continue;
-        const imdb = entry.imdb || entry.imdb_id || entry.imdbId;
-        if (!imdb || !imdb.startsWith('tt')) continue;
-
-        const arr = result.byImdb.get(imdb) || [];
-        arr.push({
-          filename: entry.filename || entry.title || '',
-          hash,
-          bytes: entry.bytes || entry.filesize || entry.size || 0,
-        });
-        result.byImdb.set(imdb, arr);
-      }
-    } else if (typeof data === 'object') {
-      // Check if keys are IMDB IDs
-      const keys = Object.keys(data);
-      const imdbKeys = keys.filter(k => k.startsWith('tt'));
-
-      if (imdbKeys.length > 0) {
-        // Format: { "tt1234567": [...entries...] }
-        for (const imdbId of imdbKeys) {
-          const entries = Array.isArray(data[imdbId]) ? data[imdbId] : [];
-          const parsed: DMMHashEntry[] = [];
-          for (const e of entries) {
-            const hash = (e.hash || e.infohash || '').toLowerCase();
-            if (!hash || hash.length !== 40) continue;
-            parsed.push({
-              filename: e.filename || e.title || e.name || '',
-              hash,
-              bytes: e.bytes || e.filesize || e.size || 0,
-            });
-          }
-          if (parsed.length > 0) result.byImdb.set(imdbId, parsed);
-        }
-      } else {
-        // Single object: { imdbId, files/hashes/torrents }
-        const imdbId = data.imdbId || data.imdb_id || data.imdb;
-        if (imdbId && imdbId.startsWith('tt')) {
-          const files = data.files || data.hashes || data.torrents || [];
-          if (Array.isArray(files)) {
-            const parsed: DMMHashEntry[] = [];
-            for (const e of files) {
-              const hash = (e.hash || e.infohash || '').toLowerCase();
-              if (!hash || hash.length !== 40) continue;
-              parsed.push({
-                filename: e.filename || e.title || '',
-                hash,
-                bytes: e.bytes || e.filesize || e.size || 0,
-              });
-            }
-            if (parsed.length > 0) result.byImdb.set(imdbId, parsed);
-          }
-        }
-      }
+    const results: RawHashEntry[] = [];
+    for (const item of items) {
+      if (!item || typeof item !== 'object') continue;
+      const hash = (item.hash || item.infohash || '').toLowerCase();
+      if (!hash || hash.length !== 40) continue;
+      results.push({
+        filename: item.filename || item.title || item.name || '',
+        hash,
+        bytes: item.bytes || item.filesize || item.size || 0,
+      });
     }
+    return results;
   } catch {
-    // ignore parse errors
+    return [];
   }
-
-  return result;
 }
 
-async function importDMMEntries(
-  client: any,
-  imdbId: string,
-  entries: DMMHashEntry[],
-): Promise<number> {
-  let imported = 0;
+// ── TMDB Title Search ─────────────────────────────────────────
 
-  for (const entry of entries) {
-    if (entry.hash.length !== 40) continue;
-    const parsed = parseTitle(entry.filename);
+async function searchTMDB(title: string, year: number | null, type: 'movie' | 'tv'): Promise<string | null> {
+  if (!config.tmdbApiKey) return null;
 
-    await client.query(`
-      INSERT INTO files (infohash, file_idx, filename, file_size, torrent_name, resolution, video_codec, hdr, metadata_src, confidence)
-      VALUES ($1, 0, $2, $3, $4, $5, $6, $7, 'dmm_hashlist', 0.3)
-      ON CONFLICT (infohash, file_idx) DO NOTHING
-    `, [entry.hash, entry.filename, entry.bytes || null, entry.filename, parsed.resolution, parsed.codec, parsed.hdr]);
+  const params = new URLSearchParams({
+    api_key: config.tmdbApiKey,
+    query: title,
+    ...(year ? { year: year.toString() } : {}),
+  });
 
-    const cr = await client.query(`
-      INSERT INTO content (imdb_id, type, title)
-      VALUES ($1, 'movie', $2)
-      ON CONFLICT (imdb_id) DO UPDATE SET updated_at = NOW()
-      RETURNING id
-    `, [imdbId, entry.filename.split(/[\.\s](?:(?:19|20)\d{2})/)[0]?.replace(/\./g, ' ').trim() || imdbId]);
+  const endpoint = type === 'tv' ? 'search/tv' : 'search/movie';
+  const data = await fetchJson(`https://api.themoviedb.org/3/${endpoint}?${params}`);
+  if (!data?.results?.length) return null;
 
-    const fr = await client.query('SELECT id FROM files WHERE infohash = $1 AND file_idx = 0', [entry.hash]);
-    if (fr.rows[0] && cr.rows[0]) {
-      await client.query(`
-        INSERT INTO content_files (content_id, file_id, match_method, confidence)
-        VALUES ($1, $2, 'dmm_hashlist', 0.7)
-        ON CONFLICT DO NOTHING
-      `, [cr.rows[0].id, fr.rows[0].id]);
-    }
-
-    await client.query(`
-      INSERT INTO probe_jobs (infohash, priority, source)
-      VALUES ($1, 0, 'dmm_hashlist')
-      ON CONFLICT (infohash) DO NOTHING
-    `, [entry.hash]);
-
-    imported++;
-  }
-
-  return imported;
+  const tmdbId = data.results[0].id;
+  // Get external IDs for IMDB
+  const extPath = type === 'tv' ? `/tv/${tmdbId}/external_ids` : `/movie/${tmdbId}/external_ids`;
+  const ext = await fetchJson(`https://api.themoviedb.org/3${extPath}?api_key=${config.tmdbApiKey}`);
+  return ext?.imdb_id || null;
 }
 
-async function seedFromDMM() {
+// ── Main Seed Pipeline ────────────────────────────────────────
+
+const DMM_GITHUB_API = 'https://api.github.com/repos/debridmediamanager/hashlists/contents';
+const DMM_RAW_BASE = 'https://raw.githubusercontent.com/debridmediamanager/hashlists/main';
+
+async function runSeedPipeline() {
   const client = await pool.connect();
-  let total = 0;
+  let totalFiles = 0;
+  let totalMatched = 0;
 
   try {
-    logger.info('Seed: Starting DMM hashlist import from GitHub');
-    seedProgress = { phase: 'listing', processed: 0, total: 0 };
+    // ═══ PHASE 1: Import DMM hashes into files table ═══
+    logger.info('Seed Phase 1: Importing DMM hashes from GitHub');
+    seedProgress = { phase: 'listing', processed: 0, total: 0, files: 0, matched: 0 };
 
-    // Get list of HTML files from DMM repo
     const listText = await fetchText(DMM_GITHUB_API);
     if (!listText) {
-      logger.error('Seed: Failed to fetch DMM file list from GitHub');
+      logger.error('Seed: Failed to fetch DMM file list');
       return;
     }
 
-    let files: { name: string; download_url: string }[];
+    let dmmFiles: { name: string; download_url: string }[];
     try {
       const listing = JSON.parse(listText);
-      files = listing.filter((f: any) => f.name.endsWith('.html') && f.type === 'file');
+      dmmFiles = listing.filter((f: any) => f.name.endsWith('.html') && f.type === 'file');
     } catch {
-      logger.error('Seed: Failed to parse DMM file list');
+      logger.error('Seed: Failed to parse DMM listing');
       return;
     }
 
-    logger.info(`Seed: Found ${files.length} DMM hashlist files`);
-    seedProgress = { phase: 'importing', processed: 0, total: files.length };
+    logger.info(`Seed: Found ${dmmFiles.length} DMM hashlist files`);
+    seedProgress = { phase: 'importing_hashes', processed: 0, total: dmmFiles.length, files: 0, matched: 0 };
 
     let batchCount = 0;
     await client.query('BEGIN');
 
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
+    for (let i = 0; i < dmmFiles.length; i++) {
+      const file = dmmFiles[i];
       const rawUrl = file.download_url || `${DMM_RAW_BASE}/${file.name}`;
 
       const html = await fetchText(rawUrl);
       if (!html) {
-        logger.debug(`Seed: Failed to download ${file.name}`);
         await sleep(2000);
         continue;
       }
 
-      const { byImdb } = parseDMMHtml(html);
-
-      // Log first file's structure for debugging
-      if (i === 0) {
-        logger.info(`Seed: First file parsed - ${byImdb.size} IMDB IDs found`);
-        // Also log raw decompressed structure
-        const matchDebug = html.match(/src="[^"]*#([^"]+)"/);
-        if (matchDebug) {
-          const dec = decompressFromBase64(matchDebug[1]);
-          if (dec) {
-            try {
-              const parsed = JSON.parse(dec);
-              const keys = Object.keys(parsed).slice(0, 5);
-              logger.info(`Seed: Data keys sample: ${JSON.stringify(keys)}`);
-              if (keys[0]) {
-                const val = parsed[keys[0]];
-                logger.info(`Seed: First key "${keys[0]}" type: ${typeof val}, isArray: ${Array.isArray(val)}, sample: ${JSON.stringify(val).substring(0, 300)}`);
-              }
-            } catch {
-              logger.info(`Seed: Raw decompressed (first 500): ${dec.substring(0, 500)}`);
-            }
-          }
-        }
-      }
-
-      if (byImdb.size === 0) {
+      const entries = decompressDMMHtml(html);
+      if (!entries.length) {
         await sleep(500);
         continue;
       }
 
-      let fileCount = 0;
-      for (const [imdbId, entries] of byImdb) {
-        const count = await importDMMEntries(client, imdbId, entries);
-        fileCount += count;
-      }
-      total += fileCount;
-      batchCount += fileCount;
+      for (const entry of entries) {
+        const parsed = parseTitle(entry.filename);
+        await client.query(`
+          INSERT INTO files (infohash, file_idx, filename, file_size, torrent_name, resolution, video_codec, hdr, metadata_src, confidence)
+          VALUES ($1, 0, $2, $3, $4, $5, $6, $7, 'dmm_hashlist', 0.3)
+          ON CONFLICT (infohash, file_idx) DO NOTHING
+        `, [entry.hash, entry.filename, entry.bytes || null, entry.filename, parsed.resolution, parsed.codec, parsed.hdr]);
 
-      if (batchCount >= 500) {
+        await client.query(`
+          INSERT INTO probe_jobs (infohash, priority, source)
+          VALUES ($1, 0, 'dmm_hashlist')
+          ON CONFLICT (infohash) DO NOTHING
+        `, [entry.hash]);
+
+        totalFiles++;
+        batchCount++;
+      }
+
+      if (batchCount >= 1000) {
         await client.query('COMMIT');
         await client.query('BEGIN');
         batchCount = 0;
       }
 
-      seedProgress = { phase: 'importing', processed: i + 1, total: files.length };
-      if (fileCount > 0) {
-        logger.info(`Seed: [${i + 1}/${files.length}] ${file.name}: ${fileCount} hashes (total: ${total})`);
+      seedProgress = { phase: 'importing_hashes', processed: i + 1, total: dmmFiles.length, files: totalFiles, matched: 0 };
+
+      if ((i + 1) % 50 === 0 || i === 0) {
+        logger.info(`Seed: [${i + 1}/${dmmFiles.length}] ${totalFiles.toLocaleString()} hashes imported`);
       }
 
-      // Rate limit GitHub
+      // Rate limit: ~1.5s between GitHub raw file requests
       await sleep(1500);
     }
 
     await client.query('COMMIT');
-    seedProgress = { phase: 'complete', processed: files.length, total: files.length };
-    logger.info(`Seed: DMM import complete! Total: ${total} streams`);
+    logger.info(`Seed Phase 1 complete: ${totalFiles.toLocaleString()} hashes imported from ${dmmFiles.length} files`);
+
+    // ═══ PHASE 2: Match filenames to IMDB IDs via TMDB ═══
+    if (config.tmdbApiKey) {
+      logger.info('Seed Phase 2: Matching filenames to IMDB IDs via TMDB');
+      seedProgress = { phase: 'matching_imdb', processed: 0, total: 0, files: totalFiles, matched: 0 };
+
+      // Get unmatched files (those without content_files edges)
+      const unmatched = await client.query(`
+        SELECT f.id, f.filename, f.infohash
+        FROM files f
+        LEFT JOIN content_files cf ON cf.file_id = f.id
+        WHERE cf.file_id IS NULL AND f.filename != ''
+        ORDER BY f.file_size DESC NULLS LAST
+        LIMIT 5000
+      `);
+
+      seedProgress.total = unmatched.rows.length;
+      logger.info(`Seed: ${unmatched.rows.length} unmatched files to process`);
+
+      // Group by clean title to avoid duplicate TMDB lookups
+      const titleCache = new Map<string, string | null>(); // cleanTitle -> imdbId
+      let batchIdx = 0;
+      await client.query('BEGIN');
+
+      for (let i = 0; i < unmatched.rows.length; i++) {
+        const row = unmatched.rows[i];
+        const parsed = parseTitle(row.filename);
+        const searchKey = `${parsed.cleanTitle}|${parsed.year || ''}`;
+
+        let imdbId: string | null;
+        if (titleCache.has(searchKey)) {
+          imdbId = titleCache.get(searchKey) || null;
+        } else {
+          const type = parsed.isEpisode ? 'tv' : 'movie';
+          imdbId = await searchTMDB(parsed.cleanTitle, parsed.year, type);
+          titleCache.set(searchKey, imdbId);
+          await sleep(300); // TMDB rate limit: ~40 req/s
+        }
+
+        if (imdbId) {
+          const cr = await client.query(`
+            INSERT INTO content (imdb_id, type, title, year)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (imdb_id) DO UPDATE SET updated_at = NOW()
+            RETURNING id
+          `, [imdbId, parsed.isEpisode ? 'series' : 'movie', parsed.cleanTitle, parsed.year]);
+
+          if (cr.rows[0]) {
+            await client.query(`
+              INSERT INTO content_files (content_id, file_id, match_method, confidence)
+              VALUES ($1, $2, 'tmdb_title_search', 0.6)
+              ON CONFLICT DO NOTHING
+            `, [cr.rows[0].id, row.id]);
+          }
+
+          totalMatched++;
+          batchIdx++;
+        }
+
+        if (batchIdx >= 200) {
+          await client.query('COMMIT');
+          await client.query('BEGIN');
+          batchIdx = 0;
+        }
+
+        seedProgress = { phase: 'matching_imdb', processed: i + 1, total: unmatched.rows.length, files: totalFiles, matched: totalMatched };
+
+        if ((i + 1) % 100 === 0) {
+          logger.info(`Seed: Matched ${totalMatched}/${i + 1} files to IMDB IDs (${titleCache.size} unique titles)`);
+        }
+      }
+
+      await client.query('COMMIT');
+      logger.info(`Seed Phase 2 complete: ${totalMatched} files matched to IMDB IDs`);
+    } else {
+      logger.info('Seed: Skipping Phase 2 (no TMDB_API_KEY configured)');
+    }
+
+    seedProgress = { phase: 'complete', processed: seedProgress.total, total: seedProgress.total, files: totalFiles, matched: totalMatched };
+    logger.info(`Seed complete! Files: ${totalFiles.toLocaleString()}, Matched: ${totalMatched.toLocaleString()}`);
+
   } catch (err: any) {
     try { await client.query('ROLLBACK'); } catch {}
     logger.error('Seed error', { error: err.message });
-    seedProgress = { phase: 'error', processed: seedProgress.processed, total: seedProgress.total };
+    seedProgress = { ...seedProgress, phase: 'error' };
   } finally {
     client.release();
   }
