@@ -160,8 +160,24 @@ function downloadPieces(
     let handshakeDone = false;
     let unchoked = false;
     let resolved = false;
-    const receivedPieces = new Map<string, Buffer>();
-    let pendingRequests: { pieceIndex: number; begin: number; length: number }[] = [];
+    let requestsSent = false;
+    let expectedBlocks = 0;
+    const receivedBlocks = new Map<string, Buffer>();
+
+    // Pre-calculate expected blocks and build block-to-request mapping
+    // Each request may be split into BLOCK_SIZE sub-blocks
+    const blockRequests: { pieceIndex: number; begin: number; length: number }[] = [];
+    for (const req of requests) {
+      let offset = req.begin;
+      let remaining = req.length;
+      while (remaining > 0) {
+        const len = Math.min(remaining, BLOCK_SIZE);
+        blockRequests.push({ pieceIndex: req.pieceIndex, begin: offset, length: len });
+        offset += len;
+        remaining -= len;
+      }
+    }
+    expectedBlocks = blockRequests.length;
 
     const cleanup = () => {
       if (sock) {
@@ -176,7 +192,13 @@ function downloadPieces(
       resolved = true;
       clearTimeout(timer);
       cleanup();
-      resolve(result);
+      // If we have blocks, reassemble per original request
+      if (result) {
+        const assembled = assembleBlocks(result, requests);
+        resolve(assembled);
+      } else {
+        resolve(null);
+      }
     };
 
     const timer = setTimeout(() => done(null), DOWNLOAD_TIMEOUT);
@@ -184,12 +206,11 @@ function downloadPieces(
     try {
       sock = createConnection({ host: peer.host, port: peer.port, timeout: CONNECT_TIMEOUT });
     } catch {
-      done(null);
+      resolve(null);
       return;
     }
 
     sock.on('connect', () => {
-      // BitTorrent handshake
       const reserved = Buffer.alloc(8);
       const handshake = Buffer.concat([
         Buffer.from([19]),
@@ -211,14 +232,12 @@ function downloadPieces(
         buffer = buffer.subarray(68);
         handshakeDone = true;
 
-        // Send interested
         const interested = Buffer.alloc(5);
         interested.writeUInt32BE(1, 0);
         interested[4] = MSG_INTERESTED;
         sock!.write(interested);
       }
 
-      // Process messages
       while (buffer.length >= 4) {
         const msgLen = buffer.readUInt32BE(0);
         if (msgLen === 0) { buffer = buffer.subarray(4); continue; }
@@ -246,7 +265,6 @@ function downloadPieces(
           unchoked = false;
           break;
         case MSG_BITFIELD:
-          // We assume peer has all pieces (if not, we'll get rejects)
           if (unchoked) sendRequests();
           break;
         case MSG_PIECE: {
@@ -255,11 +273,10 @@ function downloadPieces(
           const begin = payload.readUInt32BE(4);
           const block = payload.subarray(8);
           const key = `${index}:${begin}`;
-          receivedPieces.set(key, Buffer.from(block));
+          receivedBlocks.set(key, Buffer.from(block));
 
-          // Check if all done
-          if (receivedPieces.size >= requests.length) {
-            done(receivedPieces);
+          if (receivedBlocks.size >= expectedBlocks) {
+            done(receivedBlocks);
           }
           break;
         }
@@ -267,29 +284,49 @@ function downloadPieces(
     }
 
     function sendRequests() {
-      if (!unchoked || !sock) return;
+      if (!unchoked || !sock || requestsSent) return;
+      requestsSent = true;
 
-      // Break each request into BLOCK_SIZE sub-requests
-      for (const req of requests) {
-        let offset = req.begin;
-        let remaining = req.length;
-        while (remaining > 0) {
-          const len = Math.min(remaining, BLOCK_SIZE);
-          const msg = Buffer.alloc(17);
-          msg.writeUInt32BE(13, 0); // length
-          msg[4] = MSG_REQUEST;
-          msg.writeUInt32BE(req.pieceIndex, 5);
-          msg.writeUInt32BE(offset, 9);
-          msg.writeUInt32BE(len, 13);
-          sock!.write(msg);
-          // Track sub-request with original begin for reassembly
-          if (offset !== req.begin) {
-            // Store sub-blocks that need to be combined later
-          }
-          offset += len;
-          remaining -= len;
-        }
+      for (const block of blockRequests) {
+        const msg = Buffer.alloc(17);
+        msg.writeUInt32BE(13, 0);
+        msg[4] = MSG_REQUEST;
+        msg.writeUInt32BE(block.pieceIndex, 5);
+        msg.writeUInt32BE(block.begin, 9);
+        msg.writeUInt32BE(block.length, 13);
+        sock!.write(msg);
       }
     }
   });
+}
+
+/**
+ * Reassemble received blocks back into per-request buffers keyed by "pieceIndex:begin".
+ */
+function assembleBlocks(
+  blocks: Map<string, Buffer>,
+  requests: { pieceIndex: number; begin: number; length: number }[]
+): Map<string, Buffer> {
+  const result = new Map<string, Buffer>();
+
+  for (const req of requests) {
+    const chunks: Buffer[] = [];
+    let offset = req.begin;
+    let remaining = req.length;
+
+    while (remaining > 0) {
+      const len = Math.min(remaining, BLOCK_SIZE);
+      const key = `${req.pieceIndex}:${offset}`;
+      const block = blocks.get(key);
+      if (!block) return new Map(); // Missing block — fail
+      chunks.push(block);
+      offset += len;
+      remaining -= len;
+    }
+
+    const reqKey = `${req.pieceIndex}:${req.begin}`;
+    result.set(reqKey, Buffer.concat(chunks));
+  }
+
+  return result;
 }

@@ -91,6 +91,7 @@ function bencodeDecode(buf: Buffer, offset = 0): { value: any; offset: number } 
   }
   if (c >= 0x30 && c <= 0x39) { // string
     const colonIdx = buf.indexOf(0x3a, offset);
+    if (colonIdx === -1) throw new Error('Unterminated string length in bencode');
     const len = parseInt(buf.subarray(offset, colonIdx).toString(), 10);
     const start = colonIdx + 1;
     return { value: buf.subarray(start, start + len), offset: start + len };

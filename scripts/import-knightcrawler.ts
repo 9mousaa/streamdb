@@ -158,7 +158,7 @@ async function main() {
         imported++;
       }
 
-      if (imported % COMMIT_EVERY < BATCH_SIZE) {
+      if (imported > 0 && imported % COMMIT_EVERY === 0) {
         await client.query('COMMIT');
         await client.query('BEGIN');
         const pct = ((offset / total) * 100).toFixed(1);

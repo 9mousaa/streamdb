@@ -24,9 +24,9 @@ export function computeOsHash(firstChunk: Buffer, lastChunk: Buffer, fileSize: n
   for (let i = 0; i < CHUNK_SIZE; i += 8) {
     const vLo = firstChunk.readUInt32LE(i);
     const vHi = firstChunk.readUInt32LE(i + 4);
-    lo = (lo + vLo) >>> 0;
-    // Carry
-    if (lo < vLo) hi = (hi + 1) >>> 0;
+    const sumLo = lo + vLo;
+    if (sumLo >= 0x100000000) hi = (hi + 1) >>> 0;
+    lo = sumLo >>> 0;
     hi = (hi + vHi) >>> 0;
   }
 
@@ -34,8 +34,9 @@ export function computeOsHash(firstChunk: Buffer, lastChunk: Buffer, fileSize: n
   for (let i = 0; i < CHUNK_SIZE; i += 8) {
     const vLo = lastChunk.readUInt32LE(i);
     const vHi = lastChunk.readUInt32LE(i + 4);
-    lo = (lo + vLo) >>> 0;
-    if (lo < vLo) hi = (hi + 1) >>> 0;
+    const sumLo = lo + vLo;
+    if (sumLo >= 0x100000000) hi = (hi + 1) >>> 0;
+    lo = sumLo >>> 0;
     hi = (hi + vHi) >>> 0;
   }
 
