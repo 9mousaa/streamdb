@@ -16,7 +16,7 @@
 import pg from 'pg';
 import { readFileSync } from 'fs';
 
-const TORRENTIO_BASE = 'https://torrentio.strem.fun';
+const TORRENTIO_BASE = 'https://torrentio.strem.fun/qualityfilter=brremux,hdrall,dolbyvision,4k,1080p,720p,480p,other,scr,cam,unknown';
 const TMDB_BASE = 'https://api.themoviedb.org/3';
 const DELAY_MS = 800; // Rate limit: ~1.2 req/s to Torrentio
 const TMDB_DELAY_MS = 100;
@@ -63,7 +63,7 @@ async function fetchJson(url: string, retries = 3): Promise<any> {
   for (let i = 0; i < retries; i++) {
     try {
       const res = await fetch(url, {
-        headers: { 'User-Agent': 'StreamDB/1.0' },
+        headers: { 'User-Agent': 'StreamDB/1.0', 'Accept': 'application/json' },
         signal: AbortSignal.timeout(15000),
       });
       if (res.status === 429) {
@@ -234,7 +234,7 @@ async function importStreams(
     // Queue probe job
     await client.query(`
       INSERT INTO probe_jobs (infohash, priority, source)
-      VALUES ($1, 1, 'torrentio_seed')
+      VALUES ($1, 10, 'torrentio_seed')
       ON CONFLICT (infohash) DO NOTHING
     `, [stream.infoHash]);
 

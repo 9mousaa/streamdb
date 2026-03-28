@@ -301,6 +301,39 @@ function downloadPieces(
 }
 
 /**
+ * Download ~2MB from the middle of the largest video file in a torrent.
+ * Used for phash frame extraction.
+ */
+export async function downloadMiddleChunk(
+  infohash: string, meta: TorrentMetadata, peers: Peer[], maxPeers = 5
+): Promise<Buffer | null> {
+  const video = findVideoFile(meta);
+  if (!video || video.size < 10_000_000) return null; // Need at least 10MB file
+
+  const hashBuf = Buffer.from(infohash, 'hex');
+  if (hashBuf.length !== 20) return null;
+
+  const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB
+  const midOffset = Math.floor(video.size * 0.4); // 40% into the file
+  const length = Math.min(CHUNK_SIZE, video.size - midOffset);
+
+  const requests = piecesForRange(video.offset, midOffset, length, meta.pieceLength);
+
+  for (const peer of peers.slice(0, maxPeers)) {
+    try {
+      const pieces = await downloadPieces(hashBuf, peer, requests);
+      if (!pieces) continue;
+
+      const assembled = reassembleRange(pieces, requests, video.offset, midOffset, meta.pieceLength);
+      if (assembled.length > 0) return assembled;
+    } catch {
+      // Try next peer
+    }
+  }
+  return null;
+}
+
+/**
  * Reassemble received blocks back into per-request buffers keyed by "pieceIndex:begin".
  */
 function assembleBlocks(

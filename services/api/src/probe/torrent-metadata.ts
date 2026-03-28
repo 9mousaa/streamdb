@@ -101,20 +101,19 @@ function bencodeDecode(buf: Buffer, offset = 0): { value: any; offset: number } 
 
 /**
  * Fetch torrent metadata from a list of peers.
- * Tries each peer sequentially until one succeeds.
+ * Tries all peers in parallel, returns first success.
  */
 export async function fetchMetadata(infohash: string, peers: Peer[], maxPeers = 5): Promise<TorrentMetadata | null> {
   const hashBuf = Buffer.from(infohash, 'hex');
   if (hashBuf.length !== 20) return null;
 
   const peersToTry = peers.slice(0, maxPeers);
-  for (const peer of peersToTry) {
-    try {
-      const result = await fetchFromPeer(hashBuf, peer);
-      if (result) return result;
-    } catch {
-      // Try next peer
-    }
+  // Try all peers in parallel, return first success
+  const results = await Promise.allSettled(
+    peersToTry.map(peer => fetchFromPeer(hashBuf, peer))
+  );
+  for (const r of results) {
+    if (r.status === 'fulfilled' && r.value) return r.value;
   }
   return null;
 }

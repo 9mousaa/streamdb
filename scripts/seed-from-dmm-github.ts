@@ -135,7 +135,7 @@ async function importHashlist(
       // Queue probe job
       await client.query(`
         INSERT INTO probe_jobs (infohash, priority, source)
-        VALUES ($1, 0, 'dmm_github')
+        VALUES ($1, 10, 'dmm_github')
         ON CONFLICT (infohash) DO NOTHING
       `, [hash]);
 

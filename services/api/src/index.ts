@@ -56,6 +56,12 @@ async function start() {
       startReferenceBuilder();
     }
 
+    // Start TMDB enrichment worker (runtime data for duration matching + identity graph)
+    if (config.tmdbApiKey) {
+      const { startTmdbEnrichmentWorker } = await import('./metadata/tmdb.js');
+      startTmdbEnrichmentWorker(10_000); // One enrichment every 10s
+    }
+
     app.listen(config.port, () => {
       logger.info(`StreamDB API listening on port ${config.port}`);
     });

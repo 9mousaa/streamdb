@@ -1,10 +1,11 @@
 import { pool } from '../db/pool.js';
 import { logger } from '../utils/logger.js';
 import { fetchMetadata, type Peer, type TorrentMetadata } from './torrent-metadata.js';
-import { downloadPartial } from './piece-downloader.js';
+import { downloadPartial, downloadMiddleChunk } from './piece-downloader.js';
 import { computeOsHash } from './oshash.js';
 import { getDHTListener } from '../crawler/processor.js';
 import { extractFrames, computePhash, hammingDistance } from '../recognition/phash.js';
+import { writeFileSync, unlinkSync } from 'fs';
 import type { PoolClient } from 'pg';
 
 const VIDEO_EXTS = /\.(mkv|mp4|avi|wmv|flv|mov|webm|m4v|ts|mpg|mpeg)$/i;
@@ -17,12 +18,13 @@ export function startProbeWorker(intervalMs: number): void {
 }
 
 async function processNextJob(): Promise<void> {
-  // Claim one job using SKIP LOCKED
+  // Claim one job using SKIP LOCKED, respecting backoff via next_attempt_at
   const claim = await pool.query(`
     UPDATE probe_jobs SET status = 'processing', claimed_at = NOW()
     WHERE id = (
       SELECT id FROM probe_jobs
       WHERE status = 'pending' AND attempts < max_attempts
+        AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
       ORDER BY priority DESC, created_at
       LIMIT 1
       FOR UPDATE SKIP LOCKED
@@ -135,10 +137,14 @@ async function processNextJob(): Promise<void> {
       client.release();
     }
   } catch (err: any) {
-    logger.warn('Probe job failed', { id: job.id, infohash: job.infohash, error: err.message });
+    logger.warn('Probe job failed', { id: job.id, infohash: job.infohash, error: err.message, attempts: job.attempts });
+    // Exponential backoff: 5min, 10min, 20min, 40min...
+    const backoffMinutes = Math.pow(2, job.attempts || 0) * 5;
     await pool.query(
-      "UPDATE probe_jobs SET status = 'pending', attempts = attempts + 1, error = $1 WHERE id = $2",
-      [err.message, job.id]
+      `UPDATE probe_jobs SET status = 'pending', attempts = attempts + 1,
+       error = $1, next_attempt_at = NOW() + ($3 || ' minutes')::interval
+       WHERE id = $2`,
+      [err.message, job.id, String(backoffMinutes)]
     );
 
     // If max attempts reached, mark as failed
@@ -244,15 +250,56 @@ async function tryPhashMatch(
       refMap.set(row.content_id, list);
     }
 
-    // TODO: When we have streaming support, extract frames from the torrent
-    // and compare against reference phashes. For now, this is a placeholder
-    // that will be activated once piece downloading supports enough data
-    // for ffmpeg frame extraction.
+    // Download ~2MB from the middle of the video for frame extraction
+    const videoFile = findBestVideoFile(metadata.files);
+    if (!videoFile || videoFile.size < 10_000_000) {
+      logger.debug('Phash match: video too small or not found', { infohash });
+      return;
+    }
 
-    logger.debug('Phash match: reference database ready', {
-      contentItems: refMap.size,
-      totalFrames: refs.rows.length,
-    });
+    let midData: Buffer | null = null;
+    try {
+      midData = await downloadMiddleChunk(infohash, metadata, peers);
+    } catch (err: any) {
+      logger.debug('Phash match: failed to download middle chunk', { error: err.message });
+      return;
+    }
+    if (!midData || midData.length < 100_000) return;
+
+    // Write to temp file, extract frames with ffmpeg, compare phashes
+    const tmpFile = `/tmp/probe-${infohash.substring(0, 12)}.bin`;
+    writeFileSync(tmpFile, midData);
+    try {
+      const frames = await extractFrames(tmpFile, 1, 10);
+      if (frames.length === 0) return;
+
+      for (const frame of frames) {
+        const phash = computePhash(frame);
+        let bestMatch: { contentId: number; distance: number } | null = null;
+        for (const [contentId, refPhashes] of refMap) {
+          for (const ref of refPhashes) {
+            const dist = hammingDistance(phash, ref);
+            if (dist < 10 && (!bestMatch || dist < bestMatch.distance)) {
+              bestMatch = { contentId, distance: dist };
+            }
+          }
+        }
+        if (bestMatch) {
+          const confidence = Math.max(0.5, 0.85 - bestMatch.distance * 0.01);
+          await client.query(`
+            INSERT INTO content_files (content_id, file_id, match_method, confidence)
+            VALUES ($1, $2, 'phash', $3)
+            ON CONFLICT DO NOTHING
+          `, [bestMatch.contentId, fileId, confidence]);
+          logger.info('Phash match found', {
+            infohash, contentId: bestMatch.contentId, distance: bestMatch.distance,
+          });
+          return;
+        }
+      }
+    } finally {
+      try { unlinkSync(tmpFile); } catch {}
+    }
   } catch (err: any) {
     logger.debug('Phash match failed (non-fatal)', { error: err.message });
   }
@@ -281,10 +328,26 @@ function estimateDuration(fileSize: number, resolution: string): number | null {
  */
 async function tryDurationMatch(client: PoolClient, fileId: number, estimatedDuration: number): Promise<void> {
   try {
-    // Look for movies with similar runtime (within ±10%)
-    // This requires content to have been enriched with TMDB runtime data
-    // For now, just log the attempt — will be more useful once TMDB enrichment runs
-    logger.debug('Duration match attempt', { fileId, estimatedDuration });
+    const durationMin = Math.round(estimatedDuration / 60);
+    if (durationMin < 30 || durationMin > 300) return;
+
+    // Match against content with known runtime (from TMDB enrichment)
+    const matches = await client.query(`
+      SELECT id FROM content
+      WHERE type = 'movie' AND runtime_minutes IS NOT NULL
+        AND ABS(runtime_minutes - $1) <= 3
+      LIMIT 5
+    `, [durationMin]);
+
+    if (matches.rows.length === 1) {
+      // Only create edge if exactly one match (unambiguous)
+      await client.query(`
+        INSERT INTO content_files (content_id, file_id, match_method, confidence)
+        VALUES ($1, $2, 'duration', 0.3)
+        ON CONFLICT DO NOTHING
+      `, [matches.rows[0].id, fileId]);
+      logger.info('Duration match found', { fileId, durationMin, contentId: matches.rows[0].id });
+    }
   } catch (err: any) {
     logger.debug('Duration match failed (non-fatal)', { error: err.message });
   }
