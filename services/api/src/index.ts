@@ -5,6 +5,7 @@ import { logger } from './utils/logger.js';
 import stremioRoutes from './routes/stremio.js';
 import healthRoutes from './routes/health.js';
 import configureRoutes from './routes/configure.js';
+import seedRoutes from './routes/seed.js';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -19,7 +20,7 @@ app.use((_req, res, next) => {
   next();
 });
 
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 app.use(express.static(join(__dirname, '../../../public')));
 
 // Serve configure.html at /configure (Stremio expects this path)
@@ -29,6 +30,7 @@ app.get('/configure', (_req, res) => {
 
 // Routes
 app.use(healthRoutes);
+app.use(seedRoutes);
 app.use(configureRoutes);
 app.use(stremioRoutes);
 
