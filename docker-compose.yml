@@ -63,6 +63,13 @@ services:
       POSTGRES_DB: zilean
       POSTGRES_USER: zilean
       POSTGRES_PASSWORD: ${ZILEAN_PG_PASSWORD:-zilean_secret}
+    command: >
+      postgres
+      -c shared_buffers=256MB
+      -c work_mem=64MB
+      -c maintenance_work_mem=256MB
+      -c max_wal_size=1GB
+    shm_size: '512mb'
     volumes:
       - zilean-pgdata:/var/lib/postgresql/data
     networks:
