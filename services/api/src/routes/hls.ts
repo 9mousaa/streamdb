@@ -15,9 +15,8 @@ interface Variant {
   sourceUrl: string;
   probe: ProbeResult | null;
   probePromise: Promise<ProbeResult> | null;
-  videoFfmpeg: ChildProcess | null;
-  audioFfmpeg: Map<number, ChildProcess>;
-  videoStarted: boolean;
+  ffmpeg: ChildProcess | null;
+  started: boolean;
 }
 
 interface HlsSession {
@@ -42,8 +41,7 @@ function destroySession(id: string) {
   const session = sessions.get(id);
   if (!session) return;
   for (const v of session.variants) {
-    if (v.videoFfmpeg) v.videoFfmpeg.kill('SIGTERM');
-    for (const proc of v.audioFfmpeg.values()) proc.kill('SIGTERM');
+    if (v.ffmpeg) v.ffmpeg.kill('SIGTERM');
   }
   try { rmSync(session.segmentDir, { recursive: true, force: true }); } catch {}
   sessions.delete(id);
@@ -147,8 +145,8 @@ router.get('/hls/:sessionId/v/:vi/video/index.m3u8', async (req, res) => {
   const variant = session.variants[vi];
   if (!variant?.probe) return res.status(503).send('Not probed yet');
 
-  if (!variant.videoStarted) {
-    startVideoSegmentation(session, variant, vi);
+  if (!variant.started) {
+    startSegmentation(session, variant, vi);
   }
 
   const playlistPath = `${session.segmentDir}/v${vi}-video.m3u8`;
@@ -174,9 +172,8 @@ router.get('/hls/:sessionId/v/:vi/audio/:trackIdx/index.m3u8', async (req, res) 
   const variant = session.variants[vi];
   if (!variant?.probe) return res.status(503).send('Not probed yet');
 
-  // Start audio segmentation for this specific track on demand
-  if (!variant.audioFfmpeg.has(idx)) {
-    startAudioSegmentation(session, variant, vi, idx);
+  if (!variant.started) {
+    startSegmentation(session, variant, vi);
   }
 
   const playlistPath = `${session.segmentDir}/v${vi}-audio-${idx}.m3u8`;
@@ -254,16 +251,19 @@ router.delete('/hls/:sessionId', (req, res) => {
   res.json({ ok: true });
 });
 
-// ── Video Segmentation (copy only — zero CPU) ───────────────
+// ── Segmentation (all copy — zero CPU) ──────────────────────
 
-function startVideoSegmentation(session: HlsSession, variant: Variant, vi: number) {
-  if (variant.videoStarted || !variant.probe) return;
-  variant.videoStarted = true;
+function startSegmentation(session: HlsSession, variant: Variant, vi: number) {
+  if (variant.started || !variant.probe) return;
+  variant.started = true;
 
+  const probe = variant.probe;
   const baseUrl = `/hls/${session.id}/`;
   const prefix = `v${vi}`;
 
-  const args = [
+  // Everything is copy — no transcoding, no CPU usage
+  // Just remux from MKV/MP4 into fMP4 HLS segments
+  const args: string[] = [
     '-i', variant.sourceUrl, '-y',
     '-map', '0:v:0', '-c:v', 'copy',
     '-f', 'hls', '-hls_time', '10', '-hls_playlist_type', 'event',
@@ -274,65 +274,33 @@ function startVideoSegmentation(session: HlsSession, variant: Variant, vi: numbe
     `${session.segmentDir}/${prefix}-video.m3u8`,
   ];
 
-  logger.info('Starting video segmentation (copy)', { sessionId: session.id, variant: vi, tag: variant.tag });
-
-  const proc = spawn('/usr/bin/ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
-  proc.stderr?.on('data', (d: Buffer) => {
-    const l = d.toString().trim();
-    if (l && !l.startsWith('frame=')) logger.debug('ffmpeg-video', { session: session.id, vi, line: l.substring(0, 200) });
-  });
-  proc.on('exit', (code) => logger.info('ffmpeg-video exited', { session: session.id, vi, code }));
-  variant.videoFfmpeg = proc;
-}
-
-// ── Audio Segmentation (per-track, on demand) ───────────────
-
-function startAudioSegmentation(session: HlsSession, variant: Variant, vi: number, trackIdx: number) {
-  if (!variant.probe || variant.audioFfmpeg.has(trackIdx)) return;
-
-  const probe = variant.probe;
-  const track = probe.audioTracks[trackIdx];
-  if (!track) return;
-
-  const baseUrl = `/hls/${session.id}/`;
-  const prefix = `v${vi}`;
-  const codec = track.codec?.toLowerCase() || '';
-  const hlsOk = ['aac', 'ac3', 'eac3', 'mp3'].includes(codec);
-
-  const args = [
-    '-i', variant.sourceUrl, '-y',
-    '-map', `0:a:${trackIdx}`,
-  ];
-
-  if (hlsOk) {
-    args.push('-c:a', 'copy');
-  } else {
-    args.push('-c:a', 'aac', '-b:a', '192k');
+  // Audio: all copy, no transcoding
+  for (let i = 0; i < probe.audioTracks.length; i++) {
+    args.push(
+      '-map', `0:a:${i}`, '-c:a', 'copy',
+      '-f', 'hls', '-hls_time', '10', '-hls_playlist_type', 'event',
+      '-hls_segment_type', 'fmp4',
+      '-hls_base_url', baseUrl,
+      '-hls_fmp4_init_filename', `${prefix}-ainit-${i}.mp4`,
+      '-hls_segment_filename', `${session.segmentDir}/${prefix}-aseg-${i}-%d.m4s`,
+      `${session.segmentDir}/${prefix}-audio-${i}.m3u8`,
+    );
   }
 
-  args.push(
-    '-f', 'hls', '-hls_time', '10', '-hls_playlist_type', 'event',
-    '-hls_segment_type', 'fmp4',
-    '-hls_base_url', baseUrl,
-    '-hls_fmp4_init_filename', `${prefix}-ainit-${trackIdx}.mp4`,
-    '-hls_segment_filename', `${session.segmentDir}/${prefix}-aseg-${trackIdx}-%d.m4s`,
-    `${session.segmentDir}/${prefix}-audio-${trackIdx}.m3u8`,
-  );
-
-  logger.info('Starting audio segmentation', {
-    sessionId: session.id, variant: vi, track: trackIdx,
-    codec, action: hlsOk ? 'copy' : 'transcode',
+  logger.info('Starting segmentation (all copy)', {
+    sessionId: session.id, variant: vi, tag: variant.tag,
+    audioTracks: probe.audioTracks.length,
   });
 
   const proc = spawn('/usr/bin/ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
   proc.stderr?.on('data', (d: Buffer) => {
     const l = d.toString().trim();
     if (l && !l.startsWith('frame=') && !l.startsWith('size=')) {
-      logger.debug('ffmpeg-audio', { session: session.id, vi, track: trackIdx, line: l.substring(0, 200) });
+      logger.debug('ffmpeg', { session: session.id, vi, line: l.substring(0, 200) });
     }
   });
-  proc.on('exit', (code) => logger.info('ffmpeg-audio exited', { session: session.id, vi, track: trackIdx, code }));
-  variant.audioFfmpeg.set(trackIdx, proc);
+  proc.on('exit', (code) => logger.info('ffmpeg exited', { session: session.id, vi, code }));
+  variant.ffmpeg = proc;
 }
 
 // ── Subtitle Extraction ─────────────────────────────────────
@@ -401,9 +369,8 @@ export function createHlsSession(id: string, variantInputs: VariantInput[]): str
       sourceUrl: input.sourceUrl,
       probe: null,
       probePromise: null,
-      videoFfmpeg: null,
-      audioFfmpeg: new Map(),
-      videoStarted: false,
+      ffmpeg: null,
+      started: false,
     };
 
     variant.probePromise = probeUrl(input.sourceUrl).then(probe => {
