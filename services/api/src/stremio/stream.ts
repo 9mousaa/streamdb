@@ -96,71 +96,96 @@ export async function getStreams(
   const sortedDebrid = [...debridConfigs].sort((a, b) => a.priority - b.priority);
 
   // ── Build unified HLS master stream ───────────────────────
-  // Pick the best file per resolution to create a multi-quality HLS stream
-  // Each resolution = one TorBox unrestrict call, so we're conservative
+  // Goal: one master playlist with multiple resolutions + all audio dubs + all subs
+  // Strategy: pick the richest file per resolution (most languages, largest size)
   try {
     const { createHlsSession } = await import('../routes/hls.js');
     type VariantInput = { tag: string; sourceUrl: string };
 
-    const resolutionOrder = ['2160p', '1080p', '720p', '480p'];
-    const bestPerRes = new Map<string, { file: FileRecord; score: number }>();
+    // Score files for language richness (from filename when DB tracks empty)
+    const langKeywords = ['eng', 'fre', 'fra', 'ger', 'deu', 'ita', 'spa', 'por', 'pol', 'cze', 'ces', 'rus', 'jpn', 'kor', 'chi', 'zho', 'hin', 'ara', 'tur', 'dut', 'nld', 'swe', 'nor', 'dan', 'fin', 'hun', 'rom', 'gre', 'ell', 'heb', 'tha', 'vie', 'ind', 'ukr', 'bul', 'hrv', 'slv', 'lit', 'lat'];
 
-    for (const entry of scored) {
-      const res = entry.file.resolution || 'unknown';
-      if (!bestPerRes.has(res)) {
-        bestPerRes.set(res, entry);
+    function estimateLanguages(file: FileRecord): number {
+      // If we have probed tracks, use those
+      if (file.audio_tracks.length > 0) return file.audio_tracks.length;
+      // Otherwise estimate from filename
+      const name = (file.torrent_name || file.filename || '').toLowerCase();
+      if (name.includes('multi') || name.includes('remux')) {
+        // Count language codes in filename
+        let count = 0;
+        for (const lang of langKeywords) {
+          if (name.includes(lang)) count++;
+        }
+        return Math.max(count, 3); // MULTI/REMUX have at least 3
+      }
+      if (name.includes('dual')) return 2;
+      return 1;
+    }
+
+    // Group cached files by resolution, pick richest per resolution
+    const resolutionOrder = ['2160p', '1080p', '720p', '480p'];
+    const bestPerRes = new Map<string, FileRecord>();
+
+    for (const { file } of scored) {
+      const res = file.resolution || 'unknown';
+      if (!resolutionOrder.includes(res)) continue;
+      const avail = availability.get(file.infohash);
+      if (!avail?.some(a => a.available)) continue;
+
+      const existing = bestPerRes.get(res);
+      if (!existing) {
+        bestPerRes.set(res, file);
+      } else {
+        // Prefer file with more languages, then larger size (remux)
+        const existingLangs = estimateLanguages(existing);
+        const newLangs = estimateLanguages(file);
+        if (newLangs > existingLangs || (newLangs === existingLangs && (file.file_size || 0) > (existing.file_size || 0))) {
+          bestPerRes.set(res, file);
+        }
       }
     }
 
-    // Unrestrict up to 3 variants (limits TorBox calls)
+    // Unrestrict best file per resolution (up to 4 variants)
     const variantInputs: VariantInput[] = [];
-    const hlsTitleParts: string[] = [];
     const resolutions: string[] = [];
     let hlsBingeGroup = '';
 
     for (const res of resolutionOrder) {
-      if (variantInputs.length >= 3) break;
-      const entry = bestPerRes.get(res);
-      if (!entry) continue;
-
-      const { file } = entry;
-      const avail = availability.get(file.infohash);
-      if (!avail?.some(a => a.available)) continue;
+      if (variantInputs.length >= 4) break;
+      const file = bestPerRes.get(res);
+      if (!file) continue;
 
       const result = await unrestrictHash(file.infohash, file.file_idx, sortedDebrid);
       if (!result) continue;
 
       variantInputs.push({ tag: res, sourceUrl: result.url });
       resolutions.push(res);
+      if (!hlsBingeGroup) hlsBingeGroup = buildBingeGroup(file, result.service);
 
-      if (!hlsBingeGroup) {
-        hlsBingeGroup = buildBingeGroup(file, result.service);
-      }
+      logger.debug('HLS variant selected', {
+        res, langs: estimateLanguages(file),
+        size: file.file_size ? `${(file.file_size / (1024 ** 3)).toFixed(1)}GB` : '?',
+        name: (file.torrent_name || '').substring(0, 60),
+      });
     }
 
     if (variantInputs.length > 0) {
       const sessionId = randomUUID().replace(/-/g, '').substring(0, 16);
       createHlsSession(sessionId, variantInputs);
 
-      // Build title showing all quality levels available
-      if (resolutions.length > 1) {
-        hlsTitleParts.push(resolutions.join(' / '));
-      } else {
-        hlsTitleParts.push(resolutions[0]);
-      }
-      hlsTitleParts.push('Adaptive HLS');
+      const title = resolutions.length > 1
+        ? `${resolutions.join(' / ')} · Adaptive HLS`
+        : `${resolutions[0]} · HLS`;
 
       streams.push({
         name: 'StreamDB',
-        title: hlsTitleParts.join(' · '),
+        title,
         url: `${config.baseUrl}/hls/${sessionId}/master.m3u8`,
-        behaviorHints: {
-          bingeGroup: hlsBingeGroup,
-        },
+        behaviorHints: { bingeGroup: hlsBingeGroup },
       });
     }
   } catch (err: any) {
-    logger.debug('HLS multi-variant creation failed', { error: err.message });
+    logger.debug('HLS creation failed', { error: err.message });
   }
 
   // ── Also add direct debrid streams as fallbacks ───────────

@@ -27,7 +27,8 @@ interface HlsSession {
 }
 
 const sessions = new Map<string, HlsSession>();
-const SESSION_TTL_MS = 4 * 60 * 60 * 1000;
+const SESSION_TTL_MS = 1 * 60 * 60 * 1000; // 1 hour — keep disk usage low
+const MAX_SESSIONS = 3; // Max concurrent sessions
 const HLS_BASE = '/tmp/hls';
 
 setInterval(() => {
@@ -360,6 +361,12 @@ export interface VariantInput {
 }
 
 export function createHlsSession(id: string, variantInputs: VariantInput[]): string {
+  // Evict oldest sessions if at capacity
+  while (sessions.size >= MAX_SESSIONS) {
+    const oldest = [...sessions.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0];
+    if (oldest) destroySession(oldest[0]);
+  }
+
   const segmentDir = `${HLS_BASE}/${id}`;
   mkdirSync(segmentDir, { recursive: true });
 
