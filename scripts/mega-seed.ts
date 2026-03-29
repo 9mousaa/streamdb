@@ -16,6 +16,28 @@ import pg from 'pg';
 import { createGunzip } from 'zlib';
 import { Readable } from 'stream';
 import { createInterface } from 'readline';
+import { appendFileSync } from 'fs';
+
+// ── Logging ─────────────────────────────────────────────────
+const LOG_FILE = '/tmp/mega-seed.log';
+const origLog = console.log;
+const origError = console.error;
+const origWrite = process.stdout.write.bind(process.stdout);
+console.log = (...args: any[]) => {
+  const msg = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+  origLog(...args);
+  try { appendFileSync(LOG_FILE, msg + '\n'); } catch {}
+};
+console.error = (...args: any[]) => {
+  const msg = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+  origError(...args);
+  try { appendFileSync(LOG_FILE, '[ERROR] ' + msg + '\n'); } catch {}
+};
+const origStdoutWrite = process.stdout.write;
+process.stdout.write = function(chunk: any, ...rest: any[]) {
+  try { appendFileSync(LOG_FILE, typeof chunk === 'string' ? chunk : chunk.toString()); } catch {}
+  return origWrite(chunk, ...rest);
+} as any;
 
 // ── Config ───────────────────────────────────────────────────
 const DB_URL = process.env.DATABASE_URL || 'postgres://streamdb:streamdb_secret@localhost:5432/streamdb';
@@ -273,16 +295,17 @@ async function phase1_zileanAPI() {
   console.log(`  Already have Zilean edges: ${alreadyQueried.size.toLocaleString()} (skipping)\n`);
 
   const client = await pool.connect();
-  let queried = 0, totalHashes = 0, newEdges = 0;
+  let queried = 0, actualQueries = 0, totalHashes = 0, newEdges = 0;
 
   try {
     await client.query('BEGIN');
 
     for (let i = 0; i < imdbIds.length; i++) {
       const { imdb_id, type, title, year } = imdbIds[i];
-      if (alreadyQueried.has(imdb_id)) continue;
+      if (alreadyQueried.has(imdb_id)) { queried++; continue; }
 
       // Query Zilean filtered endpoint
+      actualQueries++;
       const data = await fetchJson(`${ZILEAN_URL}/dmm/filtered?ImdbId=${imdb_id}`);
 
       if (Array.isArray(data) && data.length > 0) {
@@ -366,23 +389,20 @@ async function phase1_zileanAPI() {
 
       queried++;
 
-      // Commit every 50 IMDB IDs
-      if (queried % 50 === 0) {
+      // Commit every 50 actual queries
+      if (actualQueries % 50 === 0) {
         await client.query('COMMIT');
         await client.query('BEGIN');
-        process.stdout.write(`\r  Zilean: ${queried.toLocaleString()} / ${imdbIds.length.toLocaleString()} queried | ${totalHashes.toLocaleString()} hashes | ${newEdges.toLocaleString()} new edges`);
+        process.stdout.write(`\r  Zilean API: ${actualQueries.toLocaleString()} queried (${queried.toLocaleString()} total) | ${totalHashes.toLocaleString()} hashes | ${newEdges.toLocaleString()} new edges`);
       }
 
       // Rate limit: local instance = fast, remote = slower
-      await sleep(ZILEAN_URL.includes('localhost') || ZILEAN_URL.includes('zilean:') ? 50 : 200);
+      await sleep(ZILEAN_URL.includes('localhost') || ZILEAN_URL.includes('zilean:') ? 20 : 200);
 
-      // Early termination: if hit rate < 2% after 500 queries, move on
-      if (queried >= 500 && queried % 500 === 0) {
-        const hitRate = totalHashes / queried;
-        if (hitRate < 0.02) {
-          console.log(`\n  Low hit rate (${(hitRate * 100).toFixed(1)}%) after ${queried} queries. Moving to next phase.`);
-          break;
-        }
+      // Check progress every 2000 actual queries
+      if (actualQueries >= 2000 && actualQueries % 2000 === 0) {
+        const hitRate = totalHashes / actualQueries;
+        console.log(`\n  Hit rate: ${(hitRate * 100).toFixed(1)}% after ${actualQueries.toLocaleString()} queries`);
         const edges = (await getStats()).edges;
         if (edges >= TARGET_EDGES) {
           console.log('\n  TARGET REACHED!');
@@ -396,7 +416,7 @@ async function phase1_zileanAPI() {
     client.release();
   }
 
-  console.log(`\n  Phase 1 complete: ${queried.toLocaleString()} IMDB IDs queried | ${totalHashes.toLocaleString()} hashes | ${newEdges.toLocaleString()} edges\n`);
+  console.log(`\n  Phase 1 complete: ${actualQueries.toLocaleString()} actual queries (${queried.toLocaleString()} total, ${alreadyQueried.size.toLocaleString()} skipped) | ${totalHashes.toLocaleString()} hashes | ${newEdges.toLocaleString()} edges\n`);
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -540,8 +560,8 @@ async function phase3_titleMatchBackfill() {
 
         // pg_trgm similarity search against content table
         const match = year
-          ? await client.query(`SELECT id, imdb_id FROM content WHERE similarity(title, $1) > 0.35 AND (year = $2 OR year IS NULL) AND imdb_id IS NOT NULL ORDER BY similarity(title, $1) DESC LIMIT 1`, [cleanTitle, year])
-          : await client.query(`SELECT id, imdb_id FROM content WHERE similarity(title, $1) > 0.45 AND imdb_id IS NOT NULL ORDER BY similarity(title, $1) DESC LIMIT 1`, [cleanTitle]);
+          ? await client.query(`SELECT id, imdb_id FROM content WHERE similarity(title, $1) > 0.25 AND (year = $2 OR year IS NULL) AND imdb_id IS NOT NULL ORDER BY similarity(title, $1) DESC LIMIT 1`, [cleanTitle, year])
+          : await client.query(`SELECT id, imdb_id FROM content WHERE similarity(title, $1) > 0.35 AND imdb_id IS NOT NULL ORDER BY similarity(title, $1) DESC LIMIT 1`, [cleanTitle]);
 
         if (match.rows[0]) {
           const parsed = parseTitle(name);
@@ -600,33 +620,51 @@ async function main() {
     console.log(`\n━━━━━━━━━━━━━━━━━━━━━ ROUND ${round} ━━━━━━━━━━━━━━━━━━━━━`);
 
     // Phase 0: Zilean Direct DB (fastest — reads PostgreSQL directly)
-    const usedDB = await phase0_zileanDirect();
+    try {
+      await phase0_zileanDirect();
+    } catch (err: any) {
+      console.error(`Phase 0 error: ${err.message}`);
+    }
     edges = await printStats();
     if (edges >= TARGET_EDGES) break;
 
-    // Phase 1: Zilean API — direct IMDB→infohash (fallback if no DB)
-    if (!usedDB) {
+    // Phase 1: Zilean API — query for ALL content IMDB IDs (always runs)
+    try {
       await phase1_zileanAPI();
-      edges = await printStats();
-      if (edges >= TARGET_EDGES) break;
+    } catch (err: any) {
+      console.error(`Phase 1 error: ${err.message}`);
     }
+    edges = await printStats();
+    if (edges >= TARGET_EDGES) break;
 
     // Phase 2: TMDB discovery (expand content table for more Zilean queries)
     const contentCount = (await pool.query('SELECT count(*)::int as c FROM content')).rows[0].c;
     if (contentCount < 500000) {
-      await phase2_tmdbDiscovery();
+      try {
+        await phase2_tmdbDiscovery();
+      } catch (err: any) {
+        console.error(`Phase 2 error: ${err.message}`);
+      }
       edges = await printStats();
       if (edges >= TARGET_EDGES) break;
 
       // Re-run Zilean with expanded content table
-      console.log('\n  Re-running Zilean with expanded content...');
-      await phase1_zileanAPI();
+      console.log('\n  Re-running Zilean API with expanded content...');
+      try {
+        await phase1_zileanAPI();
+      } catch (err: any) {
+        console.error(`Phase 1 re-run error: ${err.message}`);
+      }
       edges = await printStats();
       if (edges >= TARGET_EDGES) break;
     }
 
     // Phase 3: Title-match backfill for remaining unmatched files
-    await phase3_titleMatchBackfill();
+    try {
+      await phase3_titleMatchBackfill();
+    } catch (err: any) {
+      console.error(`Phase 3 error: ${err.message}`);
+    }
     edges = await printStats();
     if (edges >= TARGET_EDGES) break;
 
@@ -643,5 +681,6 @@ async function main() {
 
 main().catch(err => {
   console.error('Mega seed failed:', err);
+  console.error('Stack:', err.stack);
   process.exit(1);
 });
