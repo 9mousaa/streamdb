@@ -53,9 +53,15 @@ router.get('/manifest.json', (_req, res) => {
   res.json(getManifest(config.baseUrl));
 });
 
-// Configured manifest
-router.get('/:config/manifest.json', (_req, res) => {
-  res.json(getManifest(config.baseUrl));
+// Configured manifest — mark as not requiring configuration since config is embedded
+router.get('/:config/manifest.json', (req, res) => {
+  const manifest = getManifest(config.baseUrl);
+  const cfg = decodeConfig(req.params.config);
+  const hasDebrid = !!(cfg.rdApiKey || cfg.tbApiKey);
+  if (hasDebrid) {
+    manifest.behaviorHints = { configurable: true, configurationRequired: false };
+  }
+  res.json(manifest);
 });
 
 // Stream endpoint
