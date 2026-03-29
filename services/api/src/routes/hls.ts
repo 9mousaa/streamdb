@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { spawn, type ChildProcess } from 'child_process';
-import { mkdirSync, existsSync, readFileSync, readdirSync, statSync } from 'fs';
+import { mkdirSync, existsSync, readFileSync } from 'fs';
 import { rmSync } from 'fs';
 import { randomUUID } from 'crypto';
 import { probeUrl, type ProbeResult, type ProbeTrack } from '../probe/ffprobe.js';
@@ -10,14 +10,19 @@ const router = Router();
 
 // ── Session Management ──────────────────────────────────────
 
-interface HlsSession {
-  id: string;
+interface Variant {
+  tag: string;           // e.g. "2160p", "1080p"
   sourceUrl: string;
   probe: ProbeResult | null;
   probePromise: Promise<ProbeResult> | null;
-  segmentDir: string;
   ffmpeg: ChildProcess | null;
   started: boolean;
+}
+
+interface HlsSession {
+  id: string;
+  segmentDir: string;
+  variants: Variant[];
   createdAt: number;
 }
 
@@ -38,15 +43,15 @@ setInterval(() => {
 function destroySession(id: string) {
   const session = sessions.get(id);
   if (!session) return;
-  if (session.ffmpeg) {
-    session.ffmpeg.kill('SIGTERM');
+  for (const v of session.variants) {
+    if (v.ffmpeg) v.ffmpeg.kill('SIGTERM');
   }
   try { rmSync(session.segmentDir, { recursive: true, force: true }); } catch {}
   sessions.delete(id);
   logger.debug('HLS session destroyed', { id });
 }
 
-// ── Create Session ──────────────────────────────────────────
+// ── Create Session (REST) ───────────────────────────────────
 
 router.post('/hls/create', (req, res) => {
   const { url } = req.body;
@@ -55,7 +60,7 @@ router.post('/hls/create', (req, res) => {
   }
 
   const id = randomUUID().replace(/-/g, '').substring(0, 16);
-  const masterUrl = createHlsSession(id, url);
+  const masterUrl = createHlsSession(id, [{ tag: 'default', sourceUrl: url }]);
 
   res.json({ sessionId: id, masterUrl });
 });
@@ -66,21 +71,27 @@ router.get('/hls/:sessionId/master.m3u8', async (req, res) => {
   const session = sessions.get(req.params.sessionId);
   if (!session) return res.status(404).send('Session not found');
 
-  // Wait for background probe to complete (started at session creation)
-  if (!session.probe && session.probePromise) {
-    try {
-      await session.probePromise;
-    } catch (err: any) {
-      return res.status(503).send('Failed to probe source');
+  // Wait for all variant probes to complete
+  for (const v of session.variants) {
+    if (!v.probe && v.probePromise) {
+      try { await v.probePromise; } catch {}
     }
   }
-  if (!session.probe) return res.status(503).send('Probe not available');
 
-  const { probe } = session;
+  // Filter to successfully probed variants
+  const probed = session.variants.filter(v => v.probe);
+  if (probed.length === 0) return res.status(503).send('Failed to probe sources');
+
   const lines: string[] = ['#EXTM3U'];
 
-  // Audio tracks
-  const audioTracks = probe.audioTracks;
+  // Collect ALL unique audio tracks across all variants
+  // Use the variant with the most audio tracks as the "richest" source
+  const richestAudio = probed.reduce((best, v) =>
+    (v.probe!.audioTracks.length > (best.probe!.audioTracks.length)) ? v : best
+  , probed[0]);
+  const audioTracks = richestAudio.probe!.audioTracks;
+  const audioVariantIdx = session.variants.indexOf(richestAudio);
+
   if (audioTracks.length > 0) {
     for (let i = 0; i < audioTracks.length; i++) {
       const t = audioTracks[i];
@@ -88,41 +99,52 @@ router.get('/hls/:sessionId/master.m3u8', async (req, res) => {
       const name = formatTrackName(t, 'audio', i);
       const isDefault = t.is_default || i === 0 ? 'YES' : 'NO';
       lines.push(
-        `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="${name}",LANGUAGE="${lang}",DEFAULT=${isDefault},AUTOSELECT=${isDefault},URI="/hls/${session.id}/audio/${i}/index.m3u8"`
+        `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="${name}",LANGUAGE="${lang}",DEFAULT=${isDefault},AUTOSELECT=${isDefault},URI="/hls/${session.id}/v/${audioVariantIdx}/audio/${i}/index.m3u8"`
       );
     }
   }
 
-  // Subtitle tracks (skip bitmap formats like PGS that can't be WebVTT)
-  const subTracks = probe.subtitleTracks;
+  // Collect ALL unique subtitle tracks from the richest source
+  const richestSubs = probed.reduce((best, v) =>
+    (v.probe!.subtitleTracks.length > (best.probe!.subtitleTracks.length)) ? v : best
+  , probed[0]);
+  const subTracks = richestSubs.probe!.subtitleTracks;
+  const subVariantIdx = session.variants.indexOf(richestSubs);
   const bitmapFormats = ['hdmv_pgs_subtitle', 'pgssub', 'dvd_subtitle'];
   let hasTextSubs = false;
+
   for (let i = 0; i < subTracks.length; i++) {
     const t = subTracks[i];
     const fmt = t.sub_format?.toLowerCase() || '';
-    if (bitmapFormats.includes(fmt)) continue; // Skip PGS/DVD bitmap subs
+    if (bitmapFormats.includes(fmt)) continue;
     hasTextSubs = true;
     const lang = t.language || 'und';
     const name = formatTrackName(t, 'subtitle', i);
     const isDefault = t.is_default ? 'YES' : 'NO';
     const forced = t.forced ? 'YES' : 'NO';
     lines.push(
-      `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="${name}",LANGUAGE="${lang}",DEFAULT=${isDefault},AUTOSELECT=NO,FORCED=${forced},URI="/hls/${session.id}/subs/${i}/index.m3u8"`
+      `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="${name}",LANGUAGE="${lang}",DEFAULT=${isDefault},AUTOSELECT=NO,FORCED=${forced},URI="/hls/${session.id}/v/${subVariantIdx}/subs/${i}/index.m3u8"`
     );
   }
 
-  // Video stream — passthrough (no transcode)
-  const bandwidth = probe.bitrate || 20_000_000;
-  const resolution = probe.resolution === '2160p' ? '3840x2160'
-    : probe.resolution === '1080p' ? '1920x1080'
-    : probe.resolution === '720p' ? '1280x720'
-    : '1920x1080';
+  // Video variants — one per source file (different resolutions/qualities)
+  for (let vi = 0; vi < probed.length; vi++) {
+    const v = probed[vi];
+    const p = v.probe!;
+    const variantIdx = session.variants.indexOf(v);
+    const bandwidth = p.bitrate || 20_000_000;
+    const resolution = p.resolution === '2160p' ? '3840x2160'
+      : p.resolution === '1080p' ? '1920x1080'
+      : p.resolution === '720p' ? '1280x720'
+      : p.resolution === '480p' ? '854x480'
+      : '1920x1080';
 
-  let streamInf = `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${resolution}`;
-  if (audioTracks.length > 0) streamInf += ',AUDIO="audio"';
-  if (hasTextSubs) streamInf += ',SUBTITLES="subs"';
-  lines.push(streamInf);
-  lines.push(`/hls/${session.id}/video/index.m3u8`);
+    let streamInf = `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${resolution}`;
+    if (audioTracks.length > 0) streamInf += ',AUDIO="audio"';
+    if (hasTextSubs) streamInf += ',SUBTITLES="subs"';
+    lines.push(streamInf);
+    lines.push(`/hls/${session.id}/v/${variantIdx}/video/index.m3u8`);
+  }
 
   res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
   res.setHeader('Cache-Control', 'no-cache');
@@ -131,18 +153,19 @@ router.get('/hls/:sessionId/master.m3u8', async (req, res) => {
 
 // ── Video Stream Playlist ───────────────────────────────────
 
-router.get('/hls/:sessionId/video/index.m3u8', async (req, res) => {
+router.get('/hls/:sessionId/v/:variantIdx/video/index.m3u8', async (req, res) => {
   const session = sessions.get(req.params.sessionId);
   if (!session) return res.status(404).send('Session not found');
-  if (!session.probe) return res.status(503).send('Session not probed yet');
 
-  // Start ffmpeg if not already running
-  if (!session.started) {
-    startSegmentation(session);
+  const vi = parseInt(req.params.variantIdx);
+  const variant = session.variants[vi];
+  if (!variant?.probe) return res.status(503).send('Variant not probed yet');
+
+  if (!variant.started) {
+    startSegmentation(session, variant, vi);
   }
 
-  // Wait for the playlist file to appear (up to 30s)
-  const playlistPath = `${session.segmentDir}/video.m3u8`;
+  const playlistPath = `${session.segmentDir}/v${vi}-video.m3u8`;
   const deadline = Date.now() + 30_000;
   while (!existsSync(playlistPath) && Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 500));
@@ -160,17 +183,20 @@ router.get('/hls/:sessionId/video/index.m3u8', async (req, res) => {
 
 // ── Audio Stream Playlist ───────────────────────────────────
 
-router.get('/hls/:sessionId/audio/:trackIdx/index.m3u8', async (req, res) => {
+router.get('/hls/:sessionId/v/:variantIdx/audio/:trackIdx/index.m3u8', async (req, res) => {
   const session = sessions.get(req.params.sessionId);
   if (!session) return res.status(404).send('Session not found');
-  if (!session.probe) return res.status(503).send('Session not probed yet');
 
-  if (!session.started) {
-    startSegmentation(session);
+  const vi = parseInt(req.params.variantIdx);
+  const variant = session.variants[vi];
+  if (!variant?.probe) return res.status(503).send('Variant not probed yet');
+
+  if (!variant.started) {
+    startSegmentation(session, variant, vi);
   }
 
   const idx = parseInt(req.params.trackIdx);
-  const playlistPath = `${session.segmentDir}/audio-${idx}.m3u8`;
+  const playlistPath = `${session.segmentDir}/v${vi}-audio-${idx}.m3u8`;
   const deadline = Date.now() + 30_000;
   while (!existsSync(playlistPath) && Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 500));
@@ -188,29 +214,31 @@ router.get('/hls/:sessionId/audio/:trackIdx/index.m3u8', async (req, res) => {
 
 // ── Subtitle Playlist ───────────────────────────────────────
 
-router.get('/hls/:sessionId/subs/:trackIdx/index.m3u8', async (req, res) => {
+router.get('/hls/:sessionId/v/:variantIdx/subs/:trackIdx/index.m3u8', async (req, res) => {
   const session = sessions.get(req.params.sessionId);
   if (!session) return res.status(404).send('Session not found');
 
-  const idx = parseInt(req.params.trackIdx);
-  const vttPath = `${session.segmentDir}/subs/sub-${idx}.vtt`;
+  const vi = parseInt(req.params.variantIdx);
+  const variant = session.variants[vi];
+  if (!variant) return res.status(404).send('Variant not found');
 
-  // Extract subtitle if not yet done
+  const idx = parseInt(req.params.trackIdx);
+  const vttPath = `${session.segmentDir}/v${vi}-sub-${idx}.vtt`;
+
   if (!existsSync(vttPath)) {
-    await extractSubtitle(session, idx);
+    await extractSubtitle(session, variant, vi, idx);
   }
 
   if (!existsSync(vttPath)) {
     return res.status(404).send('Subtitle not available');
   }
 
-  // Return a simple HLS playlist pointing to the VTT file
   const lines = [
     '#EXTM3U',
     '#EXT-X-TARGETDURATION:99999',
     '#EXT-X-PLAYLIST-TYPE:VOD',
-    `#EXTINF:${session.probe?.duration || 7200},`,
-    `/hls/${session.id}/subs/${idx}/sub.vtt`,
+    `#EXTINF:${variant.probe?.duration || 7200},`,
+    `/hls/${session.id}/v/${vi}/subs/${idx}/sub.vtt`,
     '#EXT-X-ENDLIST',
   ];
 
@@ -220,37 +248,21 @@ router.get('/hls/:sessionId/subs/:trackIdx/index.m3u8', async (req, res) => {
 
 // ── Serve VTT file ──────────────────────────────────────────
 
-router.get('/hls/:sessionId/subs/:trackIdx/sub.vtt', (req, res) => {
+router.get('/hls/:sessionId/v/:variantIdx/subs/:trackIdx/sub.vtt', (req, res) => {
   const session = sessions.get(req.params.sessionId);
   if (!session) return res.status(404).send('Session not found');
 
+  const vi = parseInt(req.params.variantIdx);
   const idx = parseInt(req.params.trackIdx);
-  const vttPath = `${session.segmentDir}/subs/sub-${idx}.vtt`;
+  const vttPath = `${session.segmentDir}/v${vi}-sub-${idx}.vtt`;
   if (!existsSync(vttPath)) return res.status(404).send('Not found');
 
   res.setHeader('Content-Type', 'text/vtt');
   res.sendFile(vttPath);
 });
 
-// ── Serve Segments ──────────────────────────────────────────
+// ── Serve Segments (absolute URLs from hls_base_url) ────────
 
-router.get('/hls/:sessionId/:type/:filename', (req, res) => {
-  const session = sessions.get(req.params.sessionId);
-  if (!session) return res.status(404).send('Session not found');
-
-  const filePath = `${session.segmentDir}/${req.params.filename}`;
-  if (!existsSync(filePath)) return res.status(404).send('Segment not found');
-
-  const ext = req.params.filename.split('.').pop();
-  if (ext === 'ts') res.setHeader('Content-Type', 'video/mp2t');
-  else if (ext === 'm4s') res.setHeader('Content-Type', 'video/iso.segment');
-  else if (ext === 'mp4') res.setHeader('Content-Type', 'video/mp4');
-  else if (ext === 'vtt') res.setHeader('Content-Type', 'text/vtt');
-
-  res.sendFile(filePath);
-});
-
-// Also serve segments at the root level (ffmpeg outputs them here with hls_base_url)
 router.get('/hls/:sessionId/:filename', (req, res) => {
   const session = sessions.get(req.params.sessionId);
   if (!session) return res.status(404).send('Session not found');
@@ -263,6 +275,7 @@ router.get('/hls/:sessionId/:filename', (req, res) => {
   else if (ext === 'm4s') res.setHeader('Content-Type', 'video/iso.segment');
   else if (ext === 'mp4') res.setHeader('Content-Type', 'video/mp4');
   else if (ext === 'm3u8') res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+  else if (ext === 'vtt') res.setHeader('Content-Type', 'text/vtt');
 
   res.sendFile(filePath);
 });
@@ -276,19 +289,18 @@ router.delete('/hls/:sessionId', (req, res) => {
 
 // ── ffmpeg Segmentation ─────────────────────────────────────
 
-function startSegmentation(session: HlsSession) {
-  if (session.started || !session.probe) return;
-  session.started = true;
+function startSegmentation(session: HlsSession, variant: Variant, variantIdx: number) {
+  if (variant.started || !variant.probe) return;
+  variant.started = true;
 
-  const probe = session.probe;
+  const probe = variant.probe;
   const baseUrl = `/hls/${session.id}/`;
+  const prefix = `v${variantIdx}`;
 
-  // All streams use codec copy where possible — minimal CPU usage
-  // Video: always copy (zero CPU). Audio: copy if HLS-compatible, else transcode to AAC
+  // Video: always copy (zero CPU). fMP4 for HEVC compatibility
   const args: string[] = [
-    '-i', session.sourceUrl,
+    '-i', variant.sourceUrl,
     '-y',
-    // Video: copy codec (zero CPU), fMP4 segments for HEVC compatibility
     '-map', '0:v:0',
     '-c:v', 'copy',
     '-f', 'hls',
@@ -296,14 +308,12 @@ function startSegmentation(session: HlsSession) {
     '-hls_playlist_type', 'event',
     '-hls_segment_type', 'fmp4',
     '-hls_base_url', baseUrl,
-    '-hls_fmp4_init_filename', 'vinit.mp4',
-    '-hls_segment_filename', `${session.segmentDir}/vseg-%d.m4s`,
-    `${session.segmentDir}/video.m3u8`,
+    '-hls_fmp4_init_filename', `${prefix}-vinit.mp4`,
+    '-hls_segment_filename', `${session.segmentDir}/${prefix}-vseg-%d.m4s`,
+    `${session.segmentDir}/${prefix}-video.m3u8`,
   ];
 
-  // Audio tracks: copy when HLS-compatible, only transcode when necessary
-  // In fMP4 containers: AAC, AC3, EAC3, MP3 can be copied (zero CPU)
-  // TrueHD, DTS, FLAC, PCM, Opus must be transcoded to AAC
+  // Audio: copy HLS-compatible codecs, transcode only when necessary
   const audioTracks = probe.audioTracks;
   const hlsCompatibleAudio = new Set(['aac', 'ac3', 'eac3', 'mp3']);
 
@@ -311,13 +321,11 @@ function startSegmentation(session: HlsSession) {
     const codec = audioTracks[i].codec?.toLowerCase() || '';
     const canCopy = hlsCompatibleAudio.has(codec);
 
-    args.push(
-      '-map', `0:a:${i}`,
-    );
+    args.push('-map', `0:a:${i}`);
     if (canCopy) {
-      args.push('-c:a:' + i, 'copy');
+      args.push(`-c:a:${i}`, 'copy');
     } else {
-      args.push('-c:a:' + i, 'aac', '-b:a:' + i, '192k');
+      args.push(`-c:a:${i}`, 'aac', `-b:a:${i}`, '192k');
     }
     args.push(
       '-f', 'hls',
@@ -325,19 +333,20 @@ function startSegmentation(session: HlsSession) {
       '-hls_playlist_type', 'event',
       '-hls_segment_type', 'fmp4',
       '-hls_base_url', baseUrl,
-      '-hls_fmp4_init_filename', `ainit-${i}.mp4`,
-      '-hls_segment_filename', `${session.segmentDir}/aseg-${i}-%d.m4s`,
-      `${session.segmentDir}/audio-${i}.m3u8`,
+      '-hls_fmp4_init_filename', `${prefix}-ainit-${i}.mp4`,
+      '-hls_segment_filename', `${session.segmentDir}/${prefix}-aseg-${i}-%d.m4s`,
+      `${session.segmentDir}/${prefix}-audio-${i}.m3u8`,
     );
 
     logger.debug('Audio track config', {
-      sessionId: session.id, track: i, codec, action: canCopy ? 'copy' : 'transcode',
+      sessionId: session.id, variant: variantIdx, track: i,
+      codec, action: canCopy ? 'copy' : 'transcode',
     });
   }
 
   logger.info('Starting ffmpeg segmentation', {
-    sessionId: session.id,
-    audioTracks: audioTracks.length,
+    sessionId: session.id, variant: variantIdx,
+    tag: variant.tag, audioTracks: audioTracks.length,
   });
 
   const proc = spawn('/usr/bin/ffmpeg', args, {
@@ -347,32 +356,32 @@ function startSegmentation(session: HlsSession) {
   proc.stderr?.on('data', (data: Buffer) => {
     const line = data.toString().trim();
     if (line && !line.startsWith('frame=')) {
-      logger.debug('ffmpeg', { sessionId: session.id, line: line.substring(0, 200) });
+      logger.debug('ffmpeg', { sessionId: session.id, variant: variantIdx, line: line.substring(0, 200) });
     }
   });
 
   proc.on('exit', (code) => {
-    logger.info('ffmpeg exited', { sessionId: session.id, code });
+    logger.info('ffmpeg exited', { sessionId: session.id, variant: variantIdx, code });
   });
 
-  session.ffmpeg = proc;
+  variant.ffmpeg = proc;
 }
 
-async function extractSubtitle(session: HlsSession, trackIdx: number): Promise<void> {
-  const track = session.probe?.subtitleTracks[trackIdx];
+async function extractSubtitle(session: HlsSession, variant: Variant, variantIdx: number, trackIdx: number): Promise<void> {
+  const track = variant.probe?.subtitleTracks[trackIdx];
   const format = track?.sub_format?.toLowerCase() || '';
 
-  // PGS/HDMV bitmap subtitles cannot be converted to WebVTT — skip
+  // PGS/HDMV bitmap subtitles cannot be converted to WebVTT
   if (format === 'hdmv_pgs_subtitle' || format === 'pgssub' || format === 'dvd_subtitle') {
-    logger.debug('Skipping bitmap subtitle', { sessionId: session.id, trackIdx, format });
+    logger.debug('Skipping bitmap subtitle', { sessionId: session.id, variant: variantIdx, trackIdx, format });
     return;
   }
 
-  const vttPath = `${session.segmentDir}/subs/sub-${trackIdx}.vtt`;
+  const vttPath = `${session.segmentDir}/v${variantIdx}-sub-${trackIdx}.vtt`;
 
   return new Promise((resolve) => {
     const proc = spawn('/usr/bin/ffmpeg', [
-      '-i', session.sourceUrl,
+      '-i', variant.sourceUrl,
       '-map', `0:s:${trackIdx}`,
       '-c:s', 'webvtt',
       '-y', vttPath,
@@ -417,36 +426,52 @@ function formatTrackName(track: ProbeTrack, type: string, index: number): string
 
 // ── Programmatic session creation (used by stream.ts) ───────
 
-export function createHlsSession(id: string, sourceUrl: string): string {
+export interface VariantInput {
+  tag: string;
+  sourceUrl: string;
+}
+
+export function createHlsSession(id: string, variantInputs: VariantInput[]): string {
   const segmentDir = `${HLS_BASE}/${id}`;
   mkdirSync(segmentDir, { recursive: true });
-  mkdirSync(`${segmentDir}/subs`, { recursive: true });
 
-  // Start probing immediately in background — results ready by the time player requests master.m3u8
-  const probePromise = probeUrl(sourceUrl).then(probe => {
-    session.probe = probe;
-    logger.info('HLS session probed', {
-      id, audioTracks: probe.audioTracks.length, subtitleTracks: probe.subtitleTracks.length,
+  const variants: Variant[] = variantInputs.map(input => {
+    const variant: Variant = {
+      tag: input.tag,
+      sourceUrl: input.sourceUrl,
+      probe: null,
+      probePromise: null,
+      ffmpeg: null,
+      started: false,
+    };
+
+    // Start probing in background immediately
+    variant.probePromise = probeUrl(input.sourceUrl).then(probe => {
+      variant.probe = probe;
+      logger.info('HLS variant probed', {
+        id, tag: input.tag,
+        resolution: probe.resolution,
+        audioTracks: probe.audioTracks.length,
+        subtitleTracks: probe.subtitleTracks.length,
+      });
+      return probe;
+    }).catch(err => {
+      logger.error('HLS variant probe failed', { id, tag: input.tag, error: err.message });
+      throw err;
     });
-    return probe;
-  }).catch(err => {
-    logger.error('HLS probe failed', { id, error: err.message });
-    throw err;
+
+    return variant;
   });
 
   const session: HlsSession = {
     id,
-    sourceUrl,
-    probe: null,
-    probePromise,
     segmentDir,
-    ffmpeg: null,
-    started: false,
+    variants,
     createdAt: Date.now(),
   };
   sessions.set(id, session);
 
-  logger.info('HLS session created', { id });
+  logger.info('HLS session created', { id, variants: variantInputs.length });
   return `/hls/${id}/master.m3u8`;
 }
 

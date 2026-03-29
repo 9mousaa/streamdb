@@ -92,54 +92,91 @@ export async function getStreams(
   const scored = scoreFiles(cachedFiles, prefs);
 
   // Build stream objects
-  const maxStreams = singleStream ? 1 : 15;
   const streams: StremioStream[] = [];
   const sortedDebrid = [...debridConfigs].sort((a, b) => a.priority - b.priority);
 
-  let hlsCreated = false;
+  // ── Build unified HLS master stream ───────────────────────
+  // Pick the best file per resolution to create a multi-quality HLS stream
+  // Each resolution = one TorBox unrestrict call, so we're conservative
+  try {
+    const { createHlsSession } = await import('../routes/hls.js');
+    type VariantInput = { tag: string; sourceUrl: string };
 
-  for (const { file, score } of scored.slice(0, maxStreams)) {
+    const resolutionOrder = ['2160p', '1080p', '720p', '480p'];
+    const bestPerRes = new Map<string, { file: FileRecord; score: number }>();
+
+    for (const entry of scored) {
+      const res = entry.file.resolution || 'unknown';
+      if (!bestPerRes.has(res)) {
+        bestPerRes.set(res, entry);
+      }
+    }
+
+    // Unrestrict up to 3 variants (limits TorBox calls)
+    const variantInputs: VariantInput[] = [];
+    const hlsTitleParts: string[] = [];
+    const resolutions: string[] = [];
+    let hlsBingeGroup = '';
+
+    for (const res of resolutionOrder) {
+      if (variantInputs.length >= 3) break;
+      const entry = bestPerRes.get(res);
+      if (!entry) continue;
+
+      const { file } = entry;
+      const avail = availability.get(file.infohash);
+      if (!avail?.some(a => a.available)) continue;
+
+      const result = await unrestrictHash(file.infohash, file.file_idx, sortedDebrid);
+      if (!result) continue;
+
+      variantInputs.push({ tag: res, sourceUrl: result.url });
+      resolutions.push(res);
+
+      if (!hlsBingeGroup) {
+        hlsBingeGroup = buildBingeGroup(file, result.service);
+      }
+    }
+
+    if (variantInputs.length > 0) {
+      const sessionId = randomUUID().replace(/-/g, '').substring(0, 16);
+      createHlsSession(sessionId, variantInputs);
+
+      // Build title showing all quality levels available
+      if (resolutions.length > 1) {
+        hlsTitleParts.push(resolutions.join(' / '));
+      } else {
+        hlsTitleParts.push(resolutions[0]);
+      }
+      hlsTitleParts.push('Adaptive HLS');
+
+      streams.push({
+        name: 'StreamDB',
+        title: hlsTitleParts.join(' · '),
+        url: `${config.baseUrl}/hls/${sessionId}/master.m3u8`,
+        behaviorHints: {
+          bingeGroup: hlsBingeGroup,
+        },
+      });
+    }
+  } catch (err: any) {
+    logger.debug('HLS multi-variant creation failed', { error: err.message });
+  }
+
+  // ── Also add direct debrid streams as fallbacks ───────────
+  const maxDirect = singleStream ? 0 : Math.max(0, 15 - streams.length);
+  let directCount = 0;
+
+  for (const { file, score } of scored) {
+    if (directCount >= maxDirect) break;
+
     const avail = availability.get(file.infohash);
     if (!avail?.some(a => a.available)) continue;
 
-    // Get direct URL from debrid service
     const result = await unrestrictHash(file.infohash, file.file_idx, sortedDebrid);
     if (!result) continue;
 
     const serviceName = result.service === 'realdebrid' ? 'RD' : result.service === 'torbox' ? 'TB' : result.service;
-
-    // For the best stream: create an HLS session (instant, no probing yet)
-    if (!hlsCreated) {
-      try {
-        const sessionId = randomUUID().replace(/-/g, '').substring(0, 16);
-        const { createHlsSession } = await import('../routes/hls.js');
-        createHlsSession(sessionId, result.url);
-
-        const titleParts: string[] = [];
-        if (file.resolution) titleParts.push(file.resolution);
-        if (file.hdr && file.hdr.toLowerCase() !== 'sdr') titleParts.push(file.hdr);
-        if (file.video_codec) titleParts.push(file.video_codec.toUpperCase());
-        if (file.audio_tracks.length > 1) titleParts.push(`${file.audio_tracks.length} Audio`);
-        else if (file.audio_tracks.length === 1 && file.audio_tracks[0]?.codec) titleParts.push(file.audio_tracks[0].codec);
-        if (file.subtitle_tracks.length > 0) titleParts.push(`${file.subtitle_tracks.length} Subs`);
-        if (file.file_size) titleParts.push(`${(file.file_size / (1024 ** 3)).toFixed(1)}GB`);
-
-        streams.push({
-          name: 'StreamDB HLS',
-          title: titleParts.join(' \u00b7 ') || 'HLS Stream',
-          url: `${config.baseUrl}/hls/${sessionId}/master.m3u8`,
-          behaviorHints: {
-            bingeGroup: buildBingeGroup(file, result.service),
-          },
-        });
-        hlsCreated = true;
-        continue;
-      } catch (err: any) {
-        logger.debug('HLS session creation failed, falling back to direct', { error: err.message });
-      }
-    }
-
-    // Fallback: direct debrid URL
     const title = formatStreamTitle(file, score);
     const hints: Record<string, unknown> = {
       notWebReady: true,
@@ -154,8 +191,12 @@ export async function getStreams(
       url: result.url,
       behaviorHints: hints,
     });
+    directCount++;
   }
 
-  logger.info('Streams served', { imdbId, total: files.length, cached: cachedFiles.length, returned: streams.length, hasHls: hlsCreated });
+  logger.info('Streams served', {
+    imdbId, total: files.length, cached: cachedFiles.length,
+    returned: streams.length, hasHls: streams.length > 0 && streams[0].name === 'StreamDB',
+  });
   return { streams };
 }
