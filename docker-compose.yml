@@ -39,7 +39,8 @@ services:
       PROBE_CONCURRENCY: ${PROBE_CONCURRENCY:-3}
       DHT_ENABLED: ${DHT_ENABLED:-true}
       DHT_PORT: ${DHT_PORT:-6881}
-      ZILEAN_URL: ${ZILEAN_URL:-https://zilean.elfhosted.com}
+      ZILEAN_URL: ${ZILEAN_URL:-http://zilean:8181}
+      ZILEAN_DB: postgres://zilean:${ZILEAN_PG_PASSWORD:-zilean_secret}@zilean-postgres:5432/zilean
     ports:
       - "${DHT_PORT:-6881}:${DHT_PORT:-6881}/udp"
     networks:
@@ -53,8 +54,46 @@ services:
       - "traefik.http.services.streamdb.loadbalancer.server.port=3000"
       - "traefik.docker.network=traefik_proxy"
 
+  # Zilean — torrent index with IMDB→infohash mappings
+  zilean-postgres:
+    image: postgres:16-alpine
+    container_name: zilean-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: zilean
+      POSTGRES_USER: zilean
+      POSTGRES_PASSWORD: ${ZILEAN_PG_PASSWORD:-zilean_secret}
+    volumes:
+      - zilean-pgdata:/var/lib/postgresql/data
+    networks:
+      - streamdb-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zilean"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  zilean:
+    image: ipromknight/zilean:latest
+    container_name: zilean
+    restart: unless-stopped
+    depends_on:
+      zilean-postgres:
+        condition: service_healthy
+    environment:
+      Zilean__Database__ConnectionString: "Host=zilean-postgres;Port=5432;Database=zilean;Username=zilean;Password=${ZILEAN_PG_PASSWORD:-zilean_secret}"
+      Zilean__Dmm__EnableScraping: "true"
+      Zilean__Dmm__EnableEndpoint: "true"
+      Zilean__Imdb__EnableImportMatching: "true"
+      Zilean__Imdb__EnableEndpoint: "true"
+    ports:
+      - "8181:8181"
+    networks:
+      - streamdb-internal
+
 volumes:
   pgdata:
+  zilean-pgdata:
 
 networks:
   streamdb-internal:

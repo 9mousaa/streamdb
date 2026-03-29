@@ -20,7 +20,7 @@ import { createInterface } from 'readline';
 // ── Config ───────────────────────────────────────────────────
 const DB_URL = process.env.DATABASE_URL || 'postgres://streamdb:streamdb_secret@localhost:5432/streamdb';
 const TMDB_KEY = process.env.TMDB_API_KEY || '';
-const ZILEAN_URL = process.env.ZILEAN_URL || 'https://zilean.elfhosted.com';
+const ZILEAN_URL = process.env.ZILEAN_URL || 'http://zilean:8181';
 const TARGET_EDGES = 1_000_000;
 const BATCH_SIZE = 500;
 const TMDB_BASE = 'https://api.themoviedb.org/3';
@@ -74,6 +74,157 @@ async function fetchJson(url: string, retries = 3): Promise<any> {
     }
   }
   return null;
+}
+
+// ── Zilean DB Direct Import ──────────────────────────────────
+const ZILEAN_DB = process.env.ZILEAN_DB || '';
+
+async function phase0_zileanDirect(): Promise<boolean> {
+  if (!ZILEAN_DB) return false;
+
+  let zileanPool: pg.Pool;
+  try {
+    zileanPool = new pg.Pool({ connectionString: ZILEAN_DB, max: 5 });
+    await zileanPool.query('SELECT 1');
+  } catch (err: any) {
+    console.log(`  Zilean DB not available: ${err.message}`);
+    return false;
+  }
+
+  console.log('\n═══ PHASE 0: Zilean Direct DB Import ═══\n');
+
+  const countResult = await zileanPool.query('SELECT COUNT(*)::int as total FROM "Torrents" WHERE "ImdbId" IS NOT NULL');
+  const total = countResult.rows[0].total;
+  console.log(`  Zilean DB has ${total.toLocaleString()} torrents with IMDB IDs`);
+
+  if (total === 0) {
+    console.log('  Zilean DB empty (still ingesting?). Skipping.\n');
+    await zileanPool.end();
+    return false;
+  }
+
+  // Load IMDB metadata
+  const imdbResult = await zileanPool.query('SELECT "ImdbId", "Category", "Title", "Year" FROM "ImdbFiles"');
+  const imdbMap = new Map<string, { category: string; title: string; year: number | null }>();
+  for (const row of imdbResult.rows) {
+    imdbMap.set(row.ImdbId, { category: row.Category || 'movie', title: row.Title || '', year: row.Year || null });
+  }
+  console.log(`  IMDB metadata: ${imdbMap.size.toLocaleString()} entries`);
+
+  const BATCH = 2000;
+  let offset = 0, imported = 0, newEdges = 0;
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    while (offset < total) {
+      const batch = await zileanPool.query(
+        `SELECT "InfoHash", "ImdbId", "RawTitle", "Resolution", "Codec", "Seasons", "Episodes", "Size", "Year"
+         FROM "Torrents" WHERE "ImdbId" IS NOT NULL
+         ORDER BY "InfoHash" LIMIT $1 OFFSET $2`, [BATCH, offset]
+      );
+
+      if (batch.rows.length === 0) break;
+
+      for (const t of batch.rows) {
+        const hash = (t.InfoHash || '').toLowerCase().trim();
+        if (!hash || hash.length !== 40) continue;
+
+        const imdbId = t.ImdbId;
+        if (!imdbId || !imdbId.startsWith('tt')) continue;
+
+        const rawTitle = t.RawTitle || '';
+        const parsed = parseTitle(rawTitle);
+        const resolution = t.Resolution || parsed.resolution;
+        const codec = t.Codec || parsed.codec;
+        const hdr = parsed.hdr;
+        const fileSize = t.Size ? Number(t.Size) : null;
+        const seasons = Array.isArray(t.Seasons) ? t.Seasons : [];
+        const episodes = Array.isArray(t.Episodes) ? t.Episodes : [];
+
+        // Upsert file
+        await client.query(`
+          INSERT INTO files (infohash, file_idx, filename, file_size, torrent_name, resolution, video_codec, hdr, metadata_src, confidence)
+          VALUES ($1, 0, $2, $3, $4, $5, $6, $7, 'zilean', 0.5)
+          ON CONFLICT (infohash, file_idx) DO UPDATE SET
+            resolution = COALESCE(EXCLUDED.resolution, files.resolution),
+            video_codec = COALESCE(EXCLUDED.video_codec, files.video_codec),
+            file_size = COALESCE(EXCLUDED.file_size, files.file_size)
+        `, [hash, rawTitle, fileSize, rawTitle, resolution, codec, hdr]);
+
+        const imdbInfo = imdbMap.get(imdbId);
+        const title = imdbInfo?.title || rawTitle.split(/[\.\s](?:(?:19|20)\d{2})/)[0]?.replace(/\./g, ' ').trim() || imdbId;
+        const year = t.Year || imdbInfo?.year || null;
+
+        if (seasons.length > 0 && episodes.length > 0) {
+          for (let si = 0; si < seasons.length; si++) {
+            const s = seasons[si], e = episodes[si] || episodes[0] || 1;
+            const cr = await client.query(`
+              INSERT INTO content (imdb_id, type, title, year, season, episode, parent_imdb)
+              VALUES ($1, 'episode', $2, $3, $4, $5, $6)
+              ON CONFLICT (imdb_id) DO UPDATE SET updated_at = NOW() RETURNING id
+            `, [`${imdbId}:${s}:${e}`, title, year, s, e, imdbId]);
+            const fr = await client.query('SELECT id FROM files WHERE infohash = $1 AND file_idx = 0', [hash]);
+            if (fr.rows[0] && cr.rows[0]) {
+              const er = await client.query(`
+                INSERT INTO content_files (content_id, file_id, match_method, confidence)
+                VALUES ($1, $2, 'zilean', 0.85)
+                ON CONFLICT DO NOTHING RETURNING 1
+              `, [cr.rows[0].id, fr.rows[0].id]);
+              if (er.rowCount && er.rowCount > 0) { newEdges++; totalEdgesCreated++; }
+            }
+          }
+        } else {
+          const type = (imdbInfo?.category === 'tv' || imdbInfo?.category === 'tvSeries') ? 'series' : 'movie';
+          const cr = await client.query(`
+            INSERT INTO content (imdb_id, type, title, year)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (imdb_id) DO UPDATE SET updated_at = NOW() RETURNING id
+          `, [imdbId, type, title, year]);
+          const fr = await client.query('SELECT id FROM files WHERE infohash = $1 AND file_idx = 0', [hash]);
+          if (fr.rows[0] && cr.rows[0]) {
+            const er = await client.query(`
+              INSERT INTO content_files (content_id, file_id, match_method, confidence)
+              VALUES ($1, $2, 'zilean', 0.85)
+              ON CONFLICT DO NOTHING RETURNING 1
+            `, [cr.rows[0].id, fr.rows[0].id]);
+            if (er.rowCount && er.rowCount > 0) { newEdges++; totalEdgesCreated++; }
+          }
+        }
+
+        // Queue probe for metadata enrichment
+        await client.query(`
+          INSERT INTO probe_jobs (infohash, priority, source) VALUES ($1, 8, 'zilean')
+          ON CONFLICT (infohash) DO NOTHING
+        `, [hash]);
+
+        imported++;
+      }
+
+      if (imported % 10000 < BATCH) {
+        await client.query('COMMIT');
+        await client.query('BEGIN');
+        process.stdout.write(`\r  Zilean DB: ${imported.toLocaleString()} / ${total.toLocaleString()} | ${newEdges.toLocaleString()} new edges`);
+      }
+
+      offset += BATCH;
+
+      // Check target periodically
+      if (offset % 50000 < BATCH) {
+        const edges = (await getStats()).edges;
+        if (edges >= TARGET_EDGES) { console.log('\n  TARGET REACHED!'); break; }
+      }
+    }
+
+    await client.query('COMMIT');
+  } finally {
+    client.release();
+  }
+
+  console.log(`\n  Phase 0 complete: ${imported.toLocaleString()} imported | ${newEdges.toLocaleString()} edges\n`);
+  await zileanPool.end();
+  return true;
 }
 
 // ── Stats ────────────────────────────────────────────────────
@@ -443,10 +594,17 @@ async function main() {
     round++;
     console.log(`\n━━━━━━━━━━━━━━━━━━━━━ ROUND ${round} ━━━━━━━━━━━━━━━━━━━━━`);
 
-    // Phase 1: Zilean API — direct IMDB→infohash (primary source)
-    await phase1_zileanAPI();
+    // Phase 0: Zilean Direct DB (fastest — reads PostgreSQL directly)
+    const usedDB = await phase0_zileanDirect();
     edges = await printStats();
     if (edges >= TARGET_EDGES) break;
+
+    // Phase 1: Zilean API — direct IMDB→infohash (fallback if no DB)
+    if (!usedDB) {
+      await phase1_zileanAPI();
+      edges = await printStats();
+      if (edges >= TARGET_EDGES) break;
+    }
 
     // Phase 2: TMDB discovery (expand content table for more Zilean queries)
     const contentCount = (await pool.query('SELECT count(*)::int as c FROM content')).rows[0].c;
