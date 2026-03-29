@@ -41,7 +41,7 @@ async function start() {
     // Start probe worker (torrent-based, uses DHT for peer discovery)
     if (config.dhtEnabled) {
       const { startProbeWorker } = await import('./probe/worker.js');
-      startProbeWorker(config.probeIntervalMs);
+      startProbeWorker(config.probeIntervalMs, config.probeConcurrency);
     }
 
     // Start DHT passive listener if enabled

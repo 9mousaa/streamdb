@@ -35,9 +35,11 @@ services:
       BASE_URL: ${BASE_URL:-https://streamdb.plaio.cc}
       TMDB_API_KEY: ${TMDB_API_KEY:-}
       PROBE_RD_API_KEY: ${PROBE_RD_API_KEY:-}
-      PROBE_INTERVAL_MS: ${PROBE_INTERVAL_MS:-30000}
+      PROBE_INTERVAL_MS: ${PROBE_INTERVAL_MS:-10000}
+      PROBE_CONCURRENCY: ${PROBE_CONCURRENCY:-3}
       DHT_ENABLED: ${DHT_ENABLED:-true}
       DHT_PORT: ${DHT_PORT:-6881}
+      ZILEAN_URL: ${ZILEAN_URL:-https://zilean.elfhosted.com}
     ports:
       - "${DHT_PORT:-6881}:${DHT_PORT:-6881}/udp"
     networks:

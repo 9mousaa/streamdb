@@ -78,6 +78,36 @@ router.get('/api/probes', async (req, res) => {
   }
 });
 
+// Seed progress — track toward 1M target
+router.get('/api/seed-progress', async (_req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        (SELECT COUNT(*)::int FROM content) as content_count,
+        (SELECT COUNT(*)::int FROM files) as file_count,
+        (SELECT COUNT(*)::int FROM content_files) as edge_count,
+        (SELECT COUNT(*)::int FROM content_files WHERE match_method = 'zilean_api') as zilean_edges,
+        (SELECT COUNT(*)::int FROM content_files WHERE match_method = 'tmdb_title_search') as tmdb_edges,
+        (SELECT COUNT(*)::int FROM content_files WHERE match_method = 'title_match') as title_match_edges,
+        (SELECT COUNT(*)::int FROM probe_jobs WHERE status = 'pending') as probes_pending,
+        (SELECT COUNT(*)::int FROM probe_jobs WHERE status = 'completed') as probes_completed,
+        (SELECT COUNT(*)::int FROM probe_jobs WHERE status = 'failed') as probes_failed,
+        (SELECT COUNT(*)::int FROM probe_jobs WHERE status = 'processing') as probes_processing,
+        (SELECT COUNT(*)::int FROM files WHERE resolution IS NOT NULL) as files_with_resolution,
+        (SELECT COUNT(*)::int FROM files WHERE os_hash IS NOT NULL) as files_with_hash
+    `);
+    const r = result.rows[0];
+    const target = 1_000_000;
+    res.json({
+      ...r,
+      target,
+      progress_pct: parseFloat((r.edge_count / target * 100).toFixed(2)),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Admin: clear debrid cache (stale entries from bad API keys)
 router.delete('/api/debrid-cache', async (req, res) => {
   try {

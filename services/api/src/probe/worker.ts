@@ -10,11 +10,16 @@ import type { PoolClient } from 'pg';
 
 const VIDEO_EXTS = /\.(mkv|mp4|avi|wmv|flv|mov|webm|m4v|ts|mpg|mpeg)$/i;
 
-export function startProbeWorker(intervalMs: number): void {
-  logger.info('Probe worker started (torrent-based)', { intervalMs });
-  setInterval(() => processNextJob().catch(err =>
-    logger.error('Probe worker tick failed', { error: err.message })
-  ), intervalMs);
+export function startProbeWorker(intervalMs: number, concurrency = 1): void {
+  logger.info('Probe worker started (torrent-based)', { intervalMs, concurrency });
+  setInterval(() => {
+    const jobs = Array.from({ length: concurrency }, () =>
+      processNextJob().catch(err =>
+        logger.error('Probe worker tick failed', { error: err.message })
+      )
+    );
+    Promise.allSettled(jobs);
+  }, intervalMs);
 }
 
 async function processNextJob(): Promise<void> {
