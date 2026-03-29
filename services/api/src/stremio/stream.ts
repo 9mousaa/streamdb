@@ -108,36 +108,32 @@ export async function getStreams(
 
     const serviceName = result.service === 'realdebrid' ? 'RD' : result.service === 'torbox' ? 'TB' : result.service;
 
-    // For the best stream: try to create an HLS session for streaming-service experience
+    // For the best stream: create an HLS session (instant, no probing yet)
     if (!hlsCreated) {
       try {
-        // Create HLS session — probeUrl runs on-demand to discover tracks
         const sessionId = randomUUID().replace(/-/g, '').substring(0, 16);
         const { createHlsSession } = await import('../routes/hls.js');
-        const sessionUrl = await createHlsSession(sessionId, result.url);
+        createHlsSession(sessionId, result.url);
 
-        if (sessionUrl) {
-          // Build title from file metadata (track info added by probe if available)
-          const titleParts: string[] = [];
-          if (file.resolution) titleParts.push(file.resolution);
-          if (file.hdr && file.hdr.toLowerCase() !== 'sdr') titleParts.push(file.hdr);
-          if (file.video_codec) titleParts.push(file.video_codec.toUpperCase());
-          if (file.audio_tracks.length > 1) titleParts.push(`${file.audio_tracks.length} Audio`);
-          else if (file.audio_tracks.length === 1 && file.audio_tracks[0]?.codec) titleParts.push(file.audio_tracks[0].codec);
-          if (file.subtitle_tracks.length > 0) titleParts.push(`${file.subtitle_tracks.length} Subs`);
-          if (file.file_size) titleParts.push(`${(file.file_size / (1024 ** 3)).toFixed(1)}GB`);
+        const titleParts: string[] = [];
+        if (file.resolution) titleParts.push(file.resolution);
+        if (file.hdr && file.hdr.toLowerCase() !== 'sdr') titleParts.push(file.hdr);
+        if (file.video_codec) titleParts.push(file.video_codec.toUpperCase());
+        if (file.audio_tracks.length > 1) titleParts.push(`${file.audio_tracks.length} Audio`);
+        else if (file.audio_tracks.length === 1 && file.audio_tracks[0]?.codec) titleParts.push(file.audio_tracks[0].codec);
+        if (file.subtitle_tracks.length > 0) titleParts.push(`${file.subtitle_tracks.length} Subs`);
+        if (file.file_size) titleParts.push(`${(file.file_size / (1024 ** 3)).toFixed(1)}GB`);
 
-          streams.push({
-            name: 'StreamDB HLS',
-            title: titleParts.join(' \u00b7 ') || 'HLS Stream',
-            url: `${config.baseUrl}/hls/${sessionId}/master.m3u8`,
-            behaviorHints: {
-              bingeGroup: buildBingeGroup(file, result.service),
-            },
-          });
-          hlsCreated = true;
-          continue;
-        }
+        streams.push({
+          name: 'StreamDB HLS',
+          title: titleParts.join(' \u00b7 ') || 'HLS Stream',
+          url: `${config.baseUrl}/hls/${sessionId}/master.m3u8`,
+          behaviorHints: {
+            bingeGroup: buildBingeGroup(file, result.service),
+          },
+        });
+        hlsCreated = true;
+        continue;
       } catch (err: any) {
         logger.debug('HLS session creation failed, falling back to direct', { error: err.message });
       }
