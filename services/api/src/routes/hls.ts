@@ -128,10 +128,15 @@ router.get('/hls/:sessionId/master.m3u8', (req, res) => {
     }
   }
 
-  // Subtitle tracks
+  // Subtitle tracks (skip bitmap formats like PGS that can't be WebVTT)
   const subTracks = probe.subtitleTracks;
+  const bitmapFormats = ['hdmv_pgs_subtitle', 'pgssub', 'dvd_subtitle'];
+  let hasTextSubs = false;
   for (let i = 0; i < subTracks.length; i++) {
     const t = subTracks[i];
+    const fmt = t.sub_format?.toLowerCase() || '';
+    if (bitmapFormats.includes(fmt)) continue; // Skip PGS/DVD bitmap subs
+    hasTextSubs = true;
     const lang = t.language || 'und';
     const name = formatTrackName(t, 'subtitle', i);
     const isDefault = t.is_default ? 'YES' : 'NO';
@@ -150,7 +155,7 @@ router.get('/hls/:sessionId/master.m3u8', (req, res) => {
 
   let streamInf = `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${resolution}`;
   if (audioTracks.length > 0) streamInf += ',AUDIO="audio"';
-  if (subTracks.length > 0) streamInf += ',SUBTITLES="subs"';
+  if (hasTextSubs) streamInf += ',SUBTITLES="subs"';
   lines.push(streamInf);
   lines.push(`/hls/${session.id}/video/index.m3u8`);
 
@@ -271,13 +276,14 @@ router.get('/hls/:sessionId/:type/:filename', (req, res) => {
 
   const ext = req.params.filename.split('.').pop();
   if (ext === 'ts') res.setHeader('Content-Type', 'video/mp2t');
-  else if (ext === 'aac' || ext === 'mp4') res.setHeader('Content-Type', 'audio/mp4');
+  else if (ext === 'm4s') res.setHeader('Content-Type', 'video/iso.segment');
+  else if (ext === 'mp4') res.setHeader('Content-Type', 'video/mp4');
   else if (ext === 'vtt') res.setHeader('Content-Type', 'text/vtt');
 
   res.sendFile(filePath);
 });
 
-// Also serve segments at the root level (ffmpeg outputs them there)
+// Also serve segments at the root level (ffmpeg outputs them here with hls_base_url)
 router.get('/hls/:sessionId/:filename', (req, res) => {
   const session = sessions.get(req.params.sessionId);
   if (!session) return res.status(404).send('Session not found');
@@ -287,6 +293,8 @@ router.get('/hls/:sessionId/:filename', (req, res) => {
 
   const ext = req.params.filename.split('.').pop();
   if (ext === 'ts') res.setHeader('Content-Type', 'video/mp2t');
+  else if (ext === 'm4s') res.setHeader('Content-Type', 'video/iso.segment');
+  else if (ext === 'mp4') res.setHeader('Content-Type', 'video/mp4');
   else if (ext === 'm3u8') res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
 
   res.sendFile(filePath);
@@ -305,20 +313,27 @@ function startSegmentation(session: HlsSession) {
   if (session.started) return;
   session.started = true;
 
+  const baseUrl = `/hls/${session.id}/`;
+
+  // Use fMP4 segments — works with all codecs (HEVC, H.264, AAC, etc.)
+  // MPEG-TS has issues with HEVC which is common in 4K MKV torrents
   const args: string[] = [
     '-i', session.sourceUrl,
     '-y',
-    // Video: copy codec, output to video.m3u8
+    // Video: copy codec, output to video.m3u8 with fMP4 segments
     '-map', '0:v:0',
     '-c:v', 'copy',
     '-f', 'hls',
     '-hls_time', '10',
     '-hls_playlist_type', 'event',
-    '-hls_segment_filename', `${session.segmentDir}/vseg-%d.ts`,
+    '-hls_segment_type', 'fmp4',
+    '-hls_base_url', baseUrl,
+    '-hls_fmp4_init_filename', 'vinit.mp4',
+    '-hls_segment_filename', `${session.segmentDir}/vseg-%d.m4s`,
     `${session.segmentDir}/video.m3u8`,
   ];
 
-  // Audio tracks: each gets its own HLS output
+  // Audio tracks: each gets its own HLS output with fMP4 segments
   const audioTracks = session.probe.audioTracks;
   for (let i = 0; i < audioTracks.length; i++) {
     args.push(
@@ -327,7 +342,10 @@ function startSegmentation(session: HlsSession) {
       '-f', 'hls',
       '-hls_time', '10',
       '-hls_playlist_type', 'event',
-      '-hls_segment_filename', `${session.segmentDir}/aseg-${i}-%d.ts`,
+      '-hls_segment_type', 'fmp4',
+      '-hls_base_url', baseUrl,
+      '-hls_fmp4_init_filename', `ainit-${i}.mp4`,
+      '-hls_segment_filename', `${session.segmentDir}/aseg-${i}-%d.m4s`,
       `${session.segmentDir}/audio-${i}.m3u8`,
     );
   }
@@ -356,6 +374,15 @@ function startSegmentation(session: HlsSession) {
 }
 
 async function extractSubtitle(session: HlsSession, trackIdx: number): Promise<void> {
+  const track = session.probe.subtitleTracks[trackIdx];
+  const format = track?.sub_format?.toLowerCase() || '';
+
+  // PGS/HDMV bitmap subtitles cannot be converted to WebVTT — skip
+  if (format === 'hdmv_pgs_subtitle' || format === 'pgssub' || format === 'dvd_subtitle') {
+    logger.debug('Skipping bitmap subtitle', { sessionId: session.id, trackIdx, format });
+    return;
+  }
+
   const vttPath = `${session.segmentDir}/subs/sub-${trackIdx}.vtt`;
 
   return new Promise((resolve) => {

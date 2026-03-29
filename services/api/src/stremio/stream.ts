@@ -1,11 +1,9 @@
 import { getFilesForContent, getFilesForEpisode, queueProbeJob, type FileRecord } from '../db/queries/graph.js';
 import { checkDebridAvailability, unrestrictHash, type DebridConfig } from '../debrid/manager.js';
 import { scoreFiles, formatStreamTitle, type UserPreferences } from './scoring.js';
-import { probeUrl } from '../probe/ffprobe.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { randomUUID } from 'crypto';
-import { mkdirSync } from 'fs';
 
 export interface StreamResult {
   streams: StremioStream[];
@@ -111,31 +109,27 @@ export async function getStreams(
     const serviceName = result.service === 'realdebrid' ? 'RD' : result.service === 'torbox' ? 'TB' : result.service;
 
     // For the best stream: try to create an HLS session for streaming-service experience
-    if (!hlsCreated && file.audio_tracks.length > 0) {
+    if (!hlsCreated) {
       try {
-        // Build rich title from probed tracks
-        const audioSummary = file.audio_tracks.length > 1
-          ? `${file.audio_tracks.length} Audio` : (file.audio_tracks[0]?.codec || '');
-        const subSummary = file.subtitle_tracks.length > 0
-          ? `${file.subtitle_tracks.length} Subs` : '';
-
-        const titleParts: string[] = [];
-        if (file.resolution) titleParts.push(file.resolution);
-        if (file.hdr && file.hdr.toLowerCase() !== 'sdr') titleParts.push(file.hdr);
-        if (file.video_codec) titleParts.push(file.video_codec.toUpperCase());
-        if (audioSummary) titleParts.push(audioSummary);
-        if (subSummary) titleParts.push(subSummary);
-        if (file.file_size) titleParts.push(`${(file.file_size / (1024 ** 3)).toFixed(1)}GB`);
-
-        // Create HLS session via internal API
+        // Create HLS session — probeUrl runs on-demand to discover tracks
         const sessionId = randomUUID().replace(/-/g, '').substring(0, 16);
         const { createHlsSession } = await import('../routes/hls.js');
         const sessionUrl = await createHlsSession(sessionId, result.url);
 
         if (sessionUrl) {
+          // Build title from file metadata (track info added by probe if available)
+          const titleParts: string[] = [];
+          if (file.resolution) titleParts.push(file.resolution);
+          if (file.hdr && file.hdr.toLowerCase() !== 'sdr') titleParts.push(file.hdr);
+          if (file.video_codec) titleParts.push(file.video_codec.toUpperCase());
+          if (file.audio_tracks.length > 1) titleParts.push(`${file.audio_tracks.length} Audio`);
+          else if (file.audio_tracks.length === 1 && file.audio_tracks[0]?.codec) titleParts.push(file.audio_tracks[0].codec);
+          if (file.subtitle_tracks.length > 0) titleParts.push(`${file.subtitle_tracks.length} Subs`);
+          if (file.file_size) titleParts.push(`${(file.file_size / (1024 ** 3)).toFixed(1)}GB`);
+
           streams.push({
             name: 'StreamDB HLS',
-            title: titleParts.join(' \u00b7 '),
+            title: titleParts.join(' \u00b7 ') || 'HLS Stream',
             url: `${config.baseUrl}/hls/${sessionId}/master.m3u8`,
             behaviorHints: {
               bingeGroup: buildBingeGroup(file, result.service),
