@@ -262,15 +262,15 @@ async function phase1_zileanAPI() {
   const imdbIds = imdbResult.rows;
   console.log(`  Querying Zilean for ${imdbIds.length.toLocaleString()} IMDB IDs...\n`);
 
-  // Track which IMDB IDs we've already queried (to skip on repeat runs)
+  // Track which IMDB IDs already have Zilean edges (skip on repeat runs)
   const alreadyQueried = new Set<string>();
   const existingEdges = await pool.query(`
     SELECT DISTINCT c.imdb_id FROM content_files cf
     JOIN content c ON c.id = cf.content_id
-    WHERE cf.match_method = 'zilean_api' AND c.imdb_id IS NOT NULL
+    WHERE cf.match_method IN ('zilean_api', 'zilean') AND c.imdb_id IS NOT NULL
   `);
   for (const row of existingEdges.rows) alreadyQueried.add(row.imdb_id);
-  console.log(`  Already queried: ${alreadyQueried.size.toLocaleString()} (skipping)\n`);
+  console.log(`  Already have Zilean edges: ${alreadyQueried.size.toLocaleString()} (skipping)\n`);
 
   const client = await pool.connect();
   let queried = 0, totalHashes = 0, newEdges = 0;
@@ -373,11 +373,16 @@ async function phase1_zileanAPI() {
         process.stdout.write(`\r  Zilean: ${queried.toLocaleString()} / ${imdbIds.length.toLocaleString()} queried | ${totalHashes.toLocaleString()} hashes | ${newEdges.toLocaleString()} new edges`);
       }
 
-      // Rate limit: ~5 req/s to be respectful to public instance
-      await sleep(200);
+      // Rate limit: local instance = fast, remote = slower
+      await sleep(ZILEAN_URL.includes('localhost') || ZILEAN_URL.includes('zilean:') ? 50 : 200);
 
-      // Check target
-      if (queried % 500 === 0) {
+      // Early termination: if hit rate < 2% after 500 queries, move on
+      if (queried >= 500 && queried % 500 === 0) {
+        const hitRate = totalHashes / queried;
+        if (hitRate < 0.02) {
+          console.log(`\n  Low hit rate (${(hitRate * 100).toFixed(1)}%) after ${queried} queries. Moving to next phase.`);
+          break;
+        }
         const edges = (await getStats()).edges;
         if (edges >= TARGET_EDGES) {
           console.log('\n  TARGET REACHED!');
