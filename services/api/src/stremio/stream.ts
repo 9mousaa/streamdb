@@ -1,7 +1,11 @@
 import { getFilesForContent, getFilesForEpisode, queueProbeJob, type FileRecord } from '../db/queries/graph.js';
 import { checkDebridAvailability, unrestrictHash, type DebridConfig } from '../debrid/manager.js';
 import { scoreFiles, formatStreamTitle, type UserPreferences } from './scoring.js';
+import { probeUrl } from '../probe/ffprobe.js';
+import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { randomUUID } from 'crypto';
+import { mkdirSync } from 'fs';
 
 export interface StreamResult {
   streams: StremioStream[];
@@ -89,38 +93,79 @@ export async function getStreams(
   // Score and rank
   const scored = scoreFiles(cachedFiles, prefs);
 
-  // Build stream objects — only direct URLs, no raw infohash fallback
+  // Build stream objects
   const maxStreams = singleStream ? 1 : 15;
   const streams: StremioStream[] = [];
-  // Sort debrid configs by priority for unrestrict attempts
   const sortedDebrid = [...debridConfigs].sort((a, b) => a.priority - b.priority);
+
+  let hlsCreated = false;
 
   for (const { file, score } of scored.slice(0, maxStreams)) {
     const avail = availability.get(file.infohash);
     if (!avail?.some(a => a.available)) continue;
 
-    const title = formatStreamTitle(file, score);
-
     // Get direct URL from debrid service
     const result = await unrestrictHash(file.infohash, file.file_idx, sortedDebrid);
-    if (result) {
-      const hints: Record<string, unknown> = {
-        notWebReady: true,
-        bingeGroup: buildBingeGroup(file, result.service),
-      };
-      if (file.filename) hints.filename = file.filename;
-      else if (file.torrent_name) hints.filename = file.torrent_name;
+    if (!result) continue;
 
-      const serviceName = result.service === 'realdebrid' ? 'RD' : result.service === 'torbox' ? 'TB' : result.service;
-      streams.push({
-        name: `StreamDB ${serviceName}`,
-        title,
-        url: result.url,
-        behaviorHints: hints,
-      });
+    const serviceName = result.service === 'realdebrid' ? 'RD' : result.service === 'torbox' ? 'TB' : result.service;
+
+    // For the best stream: try to create an HLS session for streaming-service experience
+    if (!hlsCreated && file.audio_tracks.length > 0) {
+      try {
+        // Build rich title from probed tracks
+        const audioSummary = file.audio_tracks.length > 1
+          ? `${file.audio_tracks.length} Audio` : (file.audio_tracks[0]?.codec || '');
+        const subSummary = file.subtitle_tracks.length > 0
+          ? `${file.subtitle_tracks.length} Subs` : '';
+
+        const titleParts: string[] = [];
+        if (file.resolution) titleParts.push(file.resolution);
+        if (file.hdr && file.hdr.toLowerCase() !== 'sdr') titleParts.push(file.hdr);
+        if (file.video_codec) titleParts.push(file.video_codec.toUpperCase());
+        if (audioSummary) titleParts.push(audioSummary);
+        if (subSummary) titleParts.push(subSummary);
+        if (file.file_size) titleParts.push(`${(file.file_size / (1024 ** 3)).toFixed(1)}GB`);
+
+        // Create HLS session via internal API
+        const sessionId = randomUUID().replace(/-/g, '').substring(0, 16);
+        const { createHlsSession } = await import('../routes/hls.js');
+        const sessionUrl = await createHlsSession(sessionId, result.url);
+
+        if (sessionUrl) {
+          streams.push({
+            name: 'StreamDB HLS',
+            title: titleParts.join(' \u00b7 '),
+            url: `${config.baseUrl}/hls/${sessionId}/master.m3u8`,
+            behaviorHints: {
+              bingeGroup: buildBingeGroup(file, result.service),
+            },
+          });
+          hlsCreated = true;
+          continue;
+        }
+      } catch (err: any) {
+        logger.debug('HLS session creation failed, falling back to direct', { error: err.message });
+      }
     }
+
+    // Fallback: direct debrid URL
+    const title = formatStreamTitle(file, score);
+    const hints: Record<string, unknown> = {
+      notWebReady: true,
+      bingeGroup: buildBingeGroup(file, result.service),
+    };
+    if (file.filename) hints.filename = file.filename;
+    else if (file.torrent_name) hints.filename = file.torrent_name;
+
+    streams.push({
+      name: `StreamDB ${serviceName}`,
+      title,
+      url: result.url,
+      behaviorHints: hints,
+    });
   }
 
-  logger.info('Streams served', { imdbId, total: files.length, cached: cachedFiles.length, returned: streams.length });
+  logger.info('Streams served', { imdbId, total: files.length, cached: cachedFiles.length, returned: streams.length, hasHls: hlsCreated });
   return { streams };
 }

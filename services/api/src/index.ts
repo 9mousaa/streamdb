@@ -6,6 +6,7 @@ import stremioRoutes from './routes/stremio.js';
 import healthRoutes from './routes/health.js';
 import configureRoutes from './routes/configure.js';
 import seedRoutes from './routes/seed.js';
+import hlsRoutes from './routes/hls.js';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -32,6 +33,7 @@ app.get('/configure', (_req, res) => {
 app.use(healthRoutes);
 app.use(seedRoutes);
 app.use(configureRoutes);
+app.use(hlsRoutes);
 app.use(stremioRoutes);
 
 async function start() {

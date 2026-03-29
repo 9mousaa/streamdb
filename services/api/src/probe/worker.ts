@@ -5,6 +5,9 @@ import { downloadPartial, downloadMiddleChunk } from './piece-downloader.js';
 import { computeOsHash } from './oshash.js';
 import { getDHTListener } from '../crawler/processor.js';
 import { extractFrames, computePhash, hammingDistance } from '../recognition/phash.js';
+import { probeUrl } from './ffprobe.js';
+import { unrestrictTorBox } from '../debrid/manager.js';
+import { config } from '../config.js';
 import { writeFileSync, unlinkSync } from 'fs';
 import type { PoolClient } from 'pg';
 
@@ -97,7 +100,70 @@ async function processNextJob(): Promise<void> {
         WHERE id = $7
       `, [filename, fileSize, metadata.name, parsed.resolution, parsed.codec, parsed.hdr, fileId]);
 
-      // Step 3: Try to download partial pieces for OS hash
+      // Step 3: Real ffprobe via TorBox URL (only for files with content edges — avoid token waste)
+      const hasEdge = await client.query(
+        'SELECT 1 FROM content_files cf JOIN files f ON f.id = cf.file_id WHERE f.infohash = $1 LIMIT 1',
+        [job.infohash]
+      );
+      const alreadyProbed = await client.query(
+        "SELECT 1 FROM file_tracks WHERE file_id = $1 LIMIT 1", [fileId]
+      );
+      if (config.torboxApiKey && hasEdge.rows.length > 0 && alreadyProbed.rows.length === 0) {
+        try {
+          const tbUrl = await unrestrictTorBox(job.infohash, 0, config.torboxApiKey);
+          if (tbUrl) {
+            logger.debug('Running ffprobe via TorBox URL', { infohash: job.infohash });
+            const probe = await probeUrl(tbUrl);
+
+            // Update file with real probed metadata
+            await client.query(`
+              UPDATE files SET
+                resolution = COALESCE($1, resolution),
+                video_codec = COALESCE($2, video_codec),
+                hdr = COALESCE($3, hdr),
+                bit_depth = COALESCE($4, bit_depth),
+                bitrate = COALESCE($5, bitrate),
+                duration = COALESCE($6, duration),
+                container = COALESCE($7, container),
+                metadata_src = 'ffprobe',
+                confidence = GREATEST(confidence, 0.95),
+                probed_at = NOW()
+              WHERE id = $8
+            `, [probe.resolution, probe.video_codec, probe.hdr, probe.bit_depth,
+                probe.bitrate, probe.duration, probe.container, fileId]);
+
+            // Delete old tracks and insert real ones
+            await client.query('DELETE FROM file_tracks WHERE file_id = $1', [fileId]);
+
+            for (let ti = 0; ti < probe.audioTracks.length; ti++) {
+              const t = probe.audioTracks[ti];
+              await client.query(`
+                INSERT INTO file_tracks (file_id, track_type, codec, channels, language, forced, is_default, track_index)
+                VALUES ($1, 'audio', $2, $3, $4, $5, $6, $7)
+              `, [fileId, t.codec, t.channels, t.language, t.forced, t.is_default, ti]);
+            }
+
+            for (let ti = 0; ti < probe.subtitleTracks.length; ti++) {
+              const t = probe.subtitleTracks[ti];
+              await client.query(`
+                INSERT INTO file_tracks (file_id, track_type, codec, channels, language, sub_format, forced, is_default, track_index)
+                VALUES ($1, 'subtitle', $2, $3, $4, $5, $6, $7, $8)
+              `, [fileId, t.codec, t.channels, t.language, t.sub_format, t.forced, t.is_default, ti]);
+            }
+
+            logger.info('ffprobe completed', {
+              infohash: job.infohash,
+              resolution: probe.resolution,
+              audioTracks: probe.audioTracks.length,
+              subtitleTracks: probe.subtitleTracks.length,
+            });
+          }
+        } catch (err: any) {
+          logger.debug('ffprobe via TorBox failed (non-fatal)', { error: err.message });
+        }
+      }
+
+      // Step 4: Try to download partial pieces for OS hash
       let osHash: string | null = null;
       try {
         const partial = await downloadPartial(job.infohash, metadata, peers);

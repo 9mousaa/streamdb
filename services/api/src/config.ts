@@ -10,4 +10,5 @@ export const config = {
   dhtEnabled: process.env.DHT_ENABLED === 'true',
   dhtPort: parseInt(process.env.DHT_PORT || '6881'),
   trailerioBaseUrl: process.env.TRAILERIO_BASE_URL || 'https://trailerio.plaio.cc/api',
+  torboxApiKey: process.env.TORBOX_API_KEY || '',
 } as const;

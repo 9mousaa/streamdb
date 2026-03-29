@@ -41,6 +41,7 @@ services:
       DHT_PORT: ${DHT_PORT:-6881}
       ZILEAN_URL: ${ZILEAN_URL:-http://zilean:8181}
       ZILEAN_DB: postgres://zilean:${ZILEAN_PG_PASSWORD:-zilean_secret}@zilean-postgres:5432/zilean
+      TORBOX_API_KEY: ${TORBOX_API_KEY:-}
     ports:
       - "${DHT_PORT:-6881}:${DHT_PORT:-6881}/udp"
     networks:

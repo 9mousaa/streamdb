@@ -258,7 +258,7 @@ async function unrestrictRdLink(link: string, apiKey: string): Promise<string | 
   return download;
 }
 
-async function unrestrictTorBox(infohash: string, fileIdx: number, apiKey: string): Promise<string | null> {
+export async function unrestrictTorBox(infohash: string, fileIdx: number, apiKey: string): Promise<string | null> {
   try {
     // Create torrent request — TorBox requires multipart form data
     const formBody = new URLSearchParams();
