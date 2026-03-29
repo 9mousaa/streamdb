@@ -86,7 +86,7 @@ router.get('/api/seed-progress', async (_req, res) => {
         (SELECT COUNT(*)::int FROM content) as content_count,
         (SELECT COUNT(*)::int FROM files) as file_count,
         (SELECT COUNT(*)::int FROM content_files) as edge_count,
-        (SELECT COUNT(*)::int FROM content_files WHERE match_method = 'zilean_api') as zilean_edges,
+        (SELECT COUNT(*)::int FROM content_files WHERE match_method IN ('zilean_api', 'zilean')) as zilean_edges,
         (SELECT COUNT(*)::int FROM content_files WHERE match_method = 'tmdb_title_search') as tmdb_edges,
         (SELECT COUNT(*)::int FROM content_files WHERE match_method = 'title_match') as title_match_edges,
         (SELECT COUNT(*)::int FROM probe_jobs WHERE status = 'pending') as probes_pending,
